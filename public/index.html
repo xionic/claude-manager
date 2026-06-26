@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Claude Manager</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <h1>Claude Manager</h1>
+    </div>
+    <div class="topbar-meta">
+      <span id="session-label" class="pill">session …</span>
+      <button id="new-btn" class="btn btn-primary">+ New session</button>
+    </div>
+  </header>
+
+  <main>
+    <div id="banner" class="banner hidden"></div>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Running windows</h2>
+        <div class="panel-actions">
+          <label class="toggle"><input type="checkbox" id="claude-only" checked /> Claude only</label>
+          <button id="refresh-btn" class="btn">Refresh</button>
+        </div>
+      </div>
+      <div id="sessions"></div>
+    </section>
+  </main>
+
+  <!-- New session dialog -->
+  <div id="modal" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-head">
+        <h2>New Claude session</h2>
+        <button class="icon-btn" data-close>&times;</button>
+      </div>
+      <form id="new-form">
+        <label class="field">
+          <span>Session name</span>
+          <input id="f-name" type="text" placeholder="my-project" autocomplete="off" spellcheck="false" />
+          <small id="name-hint">Letters, numbers, dot, dash, underscore. Becomes the window name and remote-control id.</small>
+        </label>
+
+        <label class="field">
+          <span>Directory</span>
+          <div class="dir-row">
+            <input id="f-dir" type="text" placeholder="Choose a directory…" autocomplete="off" spellcheck="false" />
+            <button type="button" id="pick-btn" class="btn">Browse…</button>
+          </div>
+        </label>
+
+        <label class="field">
+          <span>Permission mode</span>
+          <select id="f-perm">
+            <option value="auto">Auto — classify each action (recommended)</option>
+            <option value="default">Ask — prompt before every action</option>
+            <option value="acceptEdits">Accept edits — auto-approve file edits</option>
+            <option value="plan">Plan — read-only, propose a plan first</option>
+            <option value="bypassPermissions">Dangerously skip all permissions</option>
+          </select>
+          <small>How Claude handles tool permissions in this session.</small>
+        </label>
+
+        <label class="checkbox-field">
+          <input type="checkbox" id="f-resume" />
+          <span>Resume most recent session in this directory (<code>--resume</code>)</span>
+        </label>
+
+        <div class="modal-foot">
+          <button type="button" class="btn" data-close>Cancel</button>
+          <button type="submit" class="btn btn-primary" id="create-btn">Create session</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Directory picker dialog -->
+  <div id="picker" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-head">
+        <h2>Pick a directory</h2>
+        <button class="icon-btn" data-close-picker>&times;</button>
+      </div>
+      <div class="picker-bar">
+        <div id="picker-path" class="picker-path"></div>
+        <div class="dir-row newdir-row">
+          <input id="newdir-name" type="text" placeholder="New folder name…" autocomplete="off" spellcheck="false" />
+          <button type="button" id="newdir-btn" class="btn">+ Folder</button>
+        </div>
+      </div>
+      <div id="picker-list" class="picker-list"></div>
+      <div class="modal-foot">
+        <div id="picker-roots" class="picker-roots"></div>
+        <div class="spacer"></div>
+        <button type="button" class="btn" data-close-picker>Cancel</button>
+        <button type="button" class="btn btn-primary" id="picker-select">Select this folder</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

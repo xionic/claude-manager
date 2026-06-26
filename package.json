@@ -1,0 +1,14 @@
+{
+  "name": "claude-manager",
+  "version": "1.0.0",
+  "description": "Web interface to manage Claude Code sessions running in tmux windows",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {}
+}
