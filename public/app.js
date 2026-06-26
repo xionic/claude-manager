@@ -8,6 +8,7 @@ const BASE = location.pathname.replace(/[^/]*$/, '');
 
 let claudeOnly = true;
 let pickerCwd = null;
+let runningNames = new Set();
 
 // ---------------------------------------------------------------------------
 // API
@@ -38,6 +39,21 @@ function banner(msg, kind = 'success', sticky = false) {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function timeAgo(ts) {
+  const secs = Math.floor((Date.now() - ts) / 1000);
+  if (secs < 60) return 'just now';
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ago`;
+}
+
+// ---------------------------------------------------------------------------
 // Session list
 // ---------------------------------------------------------------------------
 
@@ -53,10 +69,14 @@ async function loadSessions() {
   $('#session-label').textContent = `session ${data.session}`;
 
   if (!data.available) {
+    runningNames = new Set();
     $('#sessions').innerHTML =
-      `<div class="empty">tmux session <b>${data.session}</b> is not running.<br><small>${escapeHtml(data.error || '')}</small></div>`;
+      `<div class="empty">tmux session <b>${data.session}</b> is not running.<br>` +
+      `<small>Tap <b>Resume</b> on a recent session below — tmux will start automatically.</small></div>`;
     return;
   }
+
+  runningNames = new Set((data.windows || []).map((w) => w.name));
 
   let windows = data.windows;
   if (claudeOnly) windows = windows.filter((w) => w.isClaude);
@@ -94,6 +114,57 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
   );
+}
+
+// ---------------------------------------------------------------------------
+// History panel
+// ---------------------------------------------------------------------------
+
+async function loadHistory() {
+  let data;
+  try {
+    data = await api('api/history');
+  } catch {
+    data = { entries: [] };
+  }
+
+  const entries = data.entries || [];
+  if (!entries.length) {
+    $('#history').innerHTML = '<div class="empty">No recent sessions yet.</div>';
+    return;
+  }
+
+  $('#history').innerHTML = entries
+    .map((e) => {
+      const running = runningNames.has(e.name);
+      const cls = ['session', 'h-session', running ? 'claude active' : ''].filter(Boolean).join(' ');
+      const permLabel = e.permissionMode || 'auto';
+      return `
+        <div class="${cls}">
+          <span class="sw-status"></span>
+          <div class="sw-main">
+            <div class="sw-name">
+              ${escapeHtml(e.name)}
+              <span class="tag ${running ? 'claude' : ''}">${running ? 'running' : escapeHtml(permLabel)}</span>
+            </div>
+            <div class="sw-cwd">${escapeHtml(e.dir)}</div>
+          </div>
+          <div class="h-meta">
+            <span class="h-ago">${timeAgo(e.lastUsed)}</span>
+            <button class="btn btn-resume"
+              data-h-name="${escapeHtml(e.name)}"
+              data-h-dir="${escapeHtml(e.dir)}"
+              data-h-perm="${escapeHtml(permLabel)}"
+            >${running ? 'Open again' : 'Resume'}</button>
+          </div>
+        </div>`;
+    })
+    .join('');
+}
+
+async function refresh() {
+  await loadSessions();
+  await loadHistory();
 }
 
 // ---------------------------------------------------------------------------
@@ -135,7 +206,7 @@ async function submitNew(e) {
     await api('api/sessions', { method: 'POST', body: JSON.stringify({ name, directory, resume, permissionMode }) });
     closeModal();
     banner(`Started "${name}" with remote control.`, 'success');
-    await loadSessions();
+    await refresh();
   } catch (err) {
     banner(`Failed: ${err.message}`, 'error');
   } finally {
@@ -208,9 +279,9 @@ async function createDir() {
 
 function init() {
   $('#new-btn').addEventListener('click', openModal);
-  $('#refresh-btn').addEventListener('click', loadSessions);
+  $('#refresh-btn').addEventListener('click', refresh);
   $('#new-form').addEventListener('submit', submitNew);
-  $('#claude-only').addEventListener('change', (e) => { claudeOnly = e.target.checked; loadSessions(); });
+  $('#claude-only').addEventListener('change', (e) => { claudeOnly = e.target.checked; refresh(); });
 
   // Close handlers
   document.querySelectorAll('[data-close]').forEach((el) => el.addEventListener('click', closeModal));
@@ -250,15 +321,38 @@ function init() {
     try {
       await api(`api/sessions/${encodeURIComponent(btn.dataset.kill)}/kill`, { method: 'POST' });
       banner(`Killed "${btn.dataset.name}".`, 'success');
-      await loadSessions();
+      await refresh();
     } catch (err) {
       banner(`Failed to kill: ${err.message}`, 'error');
       btn.disabled = false;
     }
   });
 
-  loadSessions();
-  setInterval(loadSessions, 5000);
+  // Resume from history (event-delegated)
+  $('#history').addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-h-name]');
+    if (!btn) return;
+    const name = btn.dataset.hName;
+    const directory = btn.dataset.hDir;
+    const permissionMode = btn.dataset.hPerm || 'auto';
+    btn.disabled = true;
+    btn.textContent = 'Starting…';
+    try {
+      await api('api/sessions', {
+        method: 'POST',
+        body: JSON.stringify({ name, directory, resume: true, permissionMode }),
+      });
+      banner(`Resumed "${name}".`, 'success');
+      await refresh();
+    } catch (err) {
+      banner(`Failed to resume: ${err.message}`, 'error');
+      btn.disabled = false;
+      btn.textContent = 'Resume';
+    }
+  });
+
+  refresh();
+  setInterval(refresh, 5000);
 }
 
 document.addEventListener('DOMContentLoaded', init);
