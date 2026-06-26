@@ -129,26 +129,53 @@ async function ensureTrusted(dir) {
 }
 
 // Persisted map so a named session in a given dir always resumes the same
-// Claude session UUID — no interactive resume picker.
+// Claude session UUID — no interactive resume picker. Also tracks a history
+// list of recent sessions for the UI's one-tap resume feature.
+//
+// State file format:
+//   { sessions: { "name dir": "uuid" }, history: [{ name, dir, uuid, permissionMode, lastUsed }] }
+// Old format (flat { "name dir": "uuid" }) is migrated on first read.
 function sessionKey(name, dir) {
   return `${name} ${dir}`;
 }
-async function loadSessionMap() {
+async function loadState() {
+  let raw;
   try {
-    return JSON.parse(await fsp.readFile(STATE_FILE, 'utf8'));
+    raw = JSON.parse(await fsp.readFile(STATE_FILE, 'utf8'));
   } catch (err) {
-    if (err.code === 'ENOENT') return {};
+    if (err.code === 'ENOENT') return { sessions: {}, history: [] };
     throw err;
   }
+  // Migrate old flat format
+  if (!raw.sessions || typeof raw.sessions !== 'object') {
+    const sessions = {};
+    for (const [k, v] of Object.entries(raw)) {
+      if (typeof v === 'string') sessions[k] = v;
+    }
+    return { sessions, history: [] };
+  }
+  return { sessions: raw.sessions || {}, history: Array.isArray(raw.history) ? raw.history : [] };
 }
-async function rememberSession(name, dir, uuid) {
-  const map = await loadSessionMap();
-  map[sessionKey(name, dir)] = uuid;
-  await writeJsonAtomic(STATE_FILE, map);
+async function rememberSession(name, dir, uuid, permissionMode) {
+  const state = await loadState();
+  state.sessions[sessionKey(name, dir)] = uuid;
+  state.history = state.history.filter((e) => !(e.name === name && e.dir === dir));
+  state.history.unshift({ name, dir, uuid, permissionMode, lastUsed: Date.now() });
+  if (state.history.length > 50) state.history.length = 50;
+  await writeJsonAtomic(STATE_FILE, state);
 }
 async function lookupSession(name, dir) {
-  const map = await loadSessionMap();
-  return map[sessionKey(name, dir)] || null;
+  const state = await loadState();
+  return state.sessions[sessionKey(name, dir)] || null;
+}
+
+// Create the tmux session if it doesn't exist (also starts the server if dead).
+async function ensureTmuxSession() {
+  try {
+    await tmux(['has-session', '-t', TMUX_SESSION]);
+  } catch {
+    await tmux(['new-session', '-d', '-s', TMUX_SESSION]);
+  }
 }
 
 function sendJson(res, status, obj) {
@@ -300,6 +327,7 @@ async function createSession(req, res) {
     sessionId = await lookupSession(name, dir);
     if (sessionId) {
       claudeArgs.push('--resume', sessionId);
+      await rememberSession(name, dir, sessionId, permissionMode); // refresh lastUsed
     } else {
       // Nothing remembered for this name+dir — fall back to "most recent in
       // this directory", which also avoids the picker.
@@ -308,7 +336,14 @@ async function createSession(req, res) {
   } else {
     sessionId = crypto.randomUUID();
     claudeArgs.push('--session-id', sessionId);
-    await rememberSession(name, dir, sessionId);
+    await rememberSession(name, dir, sessionId, permissionMode);
+  }
+
+  // Ensure the tmux session exists even if the server was restarted.
+  try {
+    await ensureTmuxSession();
+  } catch (err) {
+    return sendJson(res, 500, { error: `Could not start tmux session: ${err.message}` });
   }
 
   let windowId;
@@ -348,6 +383,12 @@ async function killSession(req, res, windowId) {
     return sendJson(res, 500, { error: `tmux failed: ${msg}` });
   }
   sendJson(res, 200, { ok: true, killed: target });
+}
+
+// GET /api/history — list remembered sessions, most recent first.
+async function listHistory(req, res) {
+  const state = await loadState();
+  sendJson(res, 200, { entries: state.history });
 }
 
 // GET /api/browse?path=... — directory picker. Lists subdirectories.
@@ -483,6 +524,8 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/api/browse' && req.method === 'GET') return await browse(req, res, url);
     if (pathname === '/api/mkdir' && req.method === 'POST') return await makeDir(req, res);
+
+    if (pathname === '/api/history' && req.method === 'GET') return await listHistory(req, res);
 
     if (pathname === '/api/config' && req.method === 'GET') {
       return sendJson(res, 200, { session: TMUX_SESSION, roots: ALLOWED_ROOTS });
