@@ -1,0 +1,24 @@
+[Unit]
+Description=Claude Manager (tmux session manager web UI)
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/youruser/projects/claude_manager
+ExecStart=/usr/bin/node /home/youruser/projects/claude_manager/server.js
+Restart=on-failure
+RestartSec=3
+
+# Make sure `claude` (in ~/.local/bin) and node resolve for spawned windows.
+Environment=PATH=/home/youruser/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/youruser
+# App config (defaults shown; uncomment to override)
+Environment=CM_PORT=8765
+Environment=CM_BIND=127.0.0.1
+Environment=CM_TMUX_SESSION=0
+Environment=CM_ALLOWED_ROOTS=/home/youruser,/var/www/html
+
+[Install]
+WantedBy=multi-user.target
