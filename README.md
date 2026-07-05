@@ -32,6 +32,53 @@ The permission mode is chosen per session in the **New session** dialog
 (default **auto**); picking "Dangerously skip all permissions" uses
 `--dangerously-skip-permissions`, every other mode maps to `--permission-mode`.
 
+## Docker sandbox sessions
+
+The **New session** dialog has a **Run in Docker sandbox** toggle. When on, the
+tmux window doesn't run `claude` on the host — it runs it *inside a container*
+built from [`docker/`](docker/) (`Dockerfile` + `entrypoint.sh`), with:
+
+- the chosen project directory mounted at `/workspace` (the container sees
+  **nothing else** of the host filesystem),
+- your host `~/.claude/.credentials.json` mounted read-only so it's already
+  authenticated,
+- a persistent per-session Docker **volume** for the container's `~/.claude`, so
+  `--resume` lands on the same conversation across restarts.
+
+The window command is `sg docker -c "docker run -it --rm … claude …"`. It's
+wrapped in `sg docker` because the daemon socket is only reachable by the
+`docker` group, and the long-running tmux server may have started before that
+membership existed; `sg` applies the group per-invocation so no tmux/service
+restart is needed. Every field is shell-quoted, so a directory name with spaces
+can't inject.
+
+The first sandbox session builds the `claude-sandbox:latest` image (a few
+minutes). You can pre-build it from the dialog's **Build now** link, or the
+server builds it lazily on first use. The toggle is disabled with a hint if the
+server can't reach Docker.
+
+**KVM (hardware virtualisation).** When the sandbox toggle is on *and* the host
+has `/dev/kvm`, a nested **Enable KVM** option appears. It adds
+`--device /dev/kvm --group-add <kvm gid>` to the container so a sandboxed session
+can use hardware acceleration — e.g. booting an x86_64 Android AVD. The
+`--group-add` is required: `/dev/kvm` is mode `0660` and group-owned, so without
+it the container's `pi` user can see the device but can't open it. The image
+ships build tools but **not** the Android SDK/emulator — install those in-session
+or bake them in. KVM access is a mild loosening of the sandbox, so it's opt-in
+per session (and remembered on resume).
+
+> Requirements: Docker installed, and the service's user in the `docker` group
+> (`sudo usermod -aG docker <user>`; restart the service so it re-reads groups).
+
+## autoclaude
+
+When the manager has to **create the tmux session from scratch** (it wasn't
+running yet) and an `autoclaude` binary is on the service's `PATH`, the dialog
+offers **"Also start autoclaude in the new tmux session"** (a resume from the
+history panel asks the same via a confirm). If accepted, autoclaude is launched
+as its own `autoclaude` window in the fresh session. The option stays hidden
+when the binary isn't found or the session already exists.
+
 ## Configuration (env vars)
 
 | Var                 | Default                  | Meaning                                  |
@@ -43,6 +90,14 @@ The permission mode is chosen per session in the **New session** dialog
 | `CM_TMUX_BIN`       | `/usr/bin/tmux`          | tmux binary                              |
 | `CM_CLAUDE_BIN`     | `claude`                 | claude binary (resolved in window env)   |
 | `CM_TMUX_SOCKET`    | `/tmp/tmux-<uid>/default`| tmux socket path                         |
+| `CM_DOCKER_BIN`     | `docker`                 | docker binary                            |
+| `CM_DOCKER_IMAGE`   | `claude-sandbox:latest`  | sandbox image tag                        |
+| `CM_DOCKER_DIR`     | `<app>/docker`           | build context (Dockerfile lives here)    |
+| `CM_CLAUDE_CREDS`   | `~/.claude/.credentials.json` | creds mounted into the sandbox      |
+| `CM_SG_BIN`         | `sg`                     | group-switch wrapper for docker calls    |
+| `CM_DOCKER_GROUP`   | `docker`                 | group that can reach the docker socket   |
+| `CM_AUTOCLAUDE_BIN` | `autoclaude`             | autoclaude binary (offered if on PATH)   |
+| `CM_KVM_DEVICE`     | `/dev/kvm`               | KVM device passed through when enabled    |
 
 ## Run it manually (to test)
 

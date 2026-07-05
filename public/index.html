@@ -79,6 +79,22 @@
           <span>Resume most recent session in this directory (<code>--resume</code>)</span>
         </label>
 
+        <label class="checkbox-field" id="docker-field">
+          <input type="checkbox" id="f-docker" />
+          <span>Run in Docker sandbox — Claude runs inside a container with only this directory mounted</span>
+        </label>
+        <small id="docker-hint" class="sub-hint hidden"></small>
+
+        <label class="checkbox-field nested hidden" id="kvm-field">
+          <input type="checkbox" id="f-kvm" />
+          <span>Enable KVM — pass <code>/dev/kvm</code> through for hardware virtualisation (e.g. Android emulator)</span>
+        </label>
+
+        <label class="checkbox-field hidden" id="autoclaude-field">
+          <input type="checkbox" id="f-autoclaude" checked />
+          <span>Also start <code>autoclaude</code> in the new tmux session (auto-continues sessions at the usage-limit reset)</span>
+        </label>
+
         <div class="modal-foot">
           <button type="button" class="btn" data-close>Cancel</button>
           <button type="submit" class="btn btn-primary" id="create-btn">Create session</button>

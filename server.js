@@ -28,6 +28,36 @@ const BIND = process.env.CM_BIND || '127.0.0.1';
 const TMUX_SESSION = process.env.CM_TMUX_SESSION || '0';
 const TMUX_BIN = process.env.CM_TMUX_BIN || '/usr/bin/tmux';
 const CLAUDE_BIN = process.env.CM_CLAUDE_BIN || 'claude';
+
+// --- Docker sandbox ---
+// When a session is created with `sandbox: true`, the tmux window runs `claude`
+// *inside* a container built from docker/Dockerfile instead of on the host.
+const DOCKER_BIN = process.env.CM_DOCKER_BIN || 'docker';
+const DOCKER_IMAGE = process.env.CM_DOCKER_IMAGE || 'claude-sandbox:latest';
+const DOCKER_DIR = process.env.CM_DOCKER_DIR || path.join(__dirname, 'docker');
+// The host credentials file mounted read-only into the container so the
+// sandboxed Claude is already authenticated. Empty string disables the mount.
+const CLAUDE_CREDS =
+  process.env.CM_CLAUDE_CREDS || path.join(os.homedir(), '.claude', '.credentials.json');
+// The daemon socket is only reachable by members of the `docker` group. The
+// long-running tmux server (and possibly this service) may have been started
+// before that membership existed, so every docker invocation — ours and the
+// ones in spawned tmux windows — is wrapped in `sg docker -c` to apply the
+// group fresh. `sg` is a no-op for processes that already have the group.
+const SG_BIN = process.env.CM_SG_BIN || 'sg';
+const DOCKER_GROUP = process.env.CM_DOCKER_GROUP || 'docker';
+
+// --- autoclaude ---
+// Optional companion that auto-continues sessions when the usage limit resets.
+// We only offer to launch it when its binary resolves on PATH.
+const AUTOCLAUDE_BIN = process.env.CM_AUTOCLAUDE_BIN || 'autoclaude';
+
+// --- KVM passthrough ---
+// A sandbox session can opt in to hardware virtualisation (e.g. to boot an
+// x86_64 Android AVD) by mapping the host's /dev/kvm into the container. The
+// device is group-owned (gid varies by distro), so the container process also
+// needs that gid as a supplementary group to actually use it.
+const KVM_DEVICE = process.env.CM_KVM_DEVICE || '/dev/kvm';
 // tmux default socket for this uid; matches a plain `tmux` invocation.
 const TMUX_SOCKET =
   process.env.CM_TMUX_SOCKET ||
@@ -68,6 +98,147 @@ function tmux(args) {
       resolve(stdout);
     });
   });
+}
+
+// --- Docker helpers --------------------------------------------------------
+
+// Single-quote a value for safe inclusion in a /bin/sh command string. Because
+// `sg <group> -c <string>` runs its argument through a shell, we build that
+// string ourselves and quote every field so a directory name with spaces (or
+// anything else) can never break out. `'\''` is the standard way to embed a
+// literal single quote inside a single-quoted string.
+function shq(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+// Turn a docker argv (e.g. ['image','inspect',IMAGE]) into the argv for
+// `execFile`/tmux that runs it under the docker group: sg docker -c "docker …".
+function dockerCmd(dockerArgs) {
+  const shell = `${shq(DOCKER_BIN)} ${dockerArgs.map(shq).join(' ')}`;
+  return [SG_BIN, DOCKER_GROUP, '-c', shell];
+}
+
+// Run a docker command (server-side, non-interactive) and resolve stdout.
+function runDocker(dockerArgs, { timeout = 15000 } = {}) {
+  const [bin, ...rest] = dockerCmd(dockerArgs);
+  return new Promise((resolve, reject) => {
+    execFile(bin, rest, { timeout, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        err.stderr = stderr;
+        return reject(err);
+      }
+      resolve(stdout);
+    });
+  });
+}
+
+// Is the docker daemon reachable (binary present, socket accessible)?
+async function dockerAvailable() {
+  try {
+    await runDocker(['version', '--format', '{{.Server.Version}}'], { timeout: 6000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function dockerImageExists() {
+  try {
+    await runDocker(['image', 'inspect', DOCKER_IMAGE], { timeout: 10000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Build claude-sandbox:latest from docker/. Slow (minutes) on first run, so the
+// timeout is generous. Only called when the image is missing.
+let buildInFlight = null;
+function ensureDockerImage() {
+  if (buildInFlight) return buildInFlight;
+  buildInFlight = (async () => {
+    if (await dockerImageExists()) return;
+    console.log(`[docker] building ${DOCKER_IMAGE} from ${DOCKER_DIR} …`);
+    await runDocker(['build', '-t', DOCKER_IMAGE, DOCKER_DIR], { timeout: 20 * 60 * 1000 });
+    console.log(`[docker] built ${DOCKER_IMAGE}`);
+  })().finally(() => {
+    buildInFlight = null;
+  });
+  return buildInFlight;
+}
+
+// Is /dev/kvm present on the host, and what group owns it? Returns
+// { available, gid } — gid is the numeric group needed as a supplementary group
+// so the container's non-root user can open the device.
+function kvmInfo() {
+  try {
+    const st = fs.statSync(KVM_DEVICE);
+    if (!st.isCharacterDevice()) return { available: false, gid: null };
+    return { available: true, gid: st.gid };
+  } catch {
+    return { available: false, gid: null };
+  }
+}
+
+// Deterministic, docker-safe names derived from the session identity (name+dir).
+// The container name is human-readable; a short hash keeps two same-named
+// sessions in different directories from colliding. The home volume persists
+// Claude's per-session history so `--resume <uuid>` works across restarts.
+function sandboxNames(name, dir) {
+  const hash = crypto.createHash('sha1').update(`${name}\0${dir}`).digest('hex');
+  const clean = name.toLowerCase().replace(/[^a-z0-9_.-]/g, '-').replace(/^[^a-z0-9]+/, '') || 'session';
+  return {
+    container: `claude-sandbox-${clean}-${hash.slice(0, 6)}`,
+    homeVolume: `claude-mgr-home-${hash.slice(0, 16)}`,
+  };
+}
+
+// Does the sandbox home volume actually contain the saved conversation for this
+// session UUID? A remembered UUID whose session never got written (e.g. the
+// first run died on a prompt) would make `claude --resume` hard-fail and the
+// tmux window vanish. Claude stores sessions at ~/.claude/projects/<enc>/<uuid>.jsonl;
+// we glob across encodings. Runs a throwaway container mounting just the volume.
+async function sandboxSessionSaved(volume, uuid) {
+  try {
+    await runDocker(
+      [
+        'run', '--rm', '-v', `${volume}:/home/youruser/.claude`, DOCKER_IMAGE,
+        'bash', '-lc', `ls /home/youruser/.claude/projects/*/${uuid}.jsonl >/dev/null 2>&1`,
+      ],
+      { timeout: 20000 }
+    );
+    return true; // exit 0 → the session file exists
+  } catch {
+    return false;
+  }
+}
+
+// Resolve a bare command name to an absolute path on PATH (executable regular
+// file). Returns the path or null. Used to gate the autoclaude option and to
+// hand tmux an absolute path (its own env PATH may differ from ours).
+function binaryOnPath(bin) {
+  if (bin.includes('/')) {
+    try {
+      fs.accessSync(bin, fs.constants.X_OK);
+      return bin;
+    } catch {
+      return null;
+    }
+  }
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue;
+    const full = path.join(dir, bin);
+    try {
+      const st = fs.statSync(full);
+      if (st.isFile()) {
+        fs.accessSync(full, fs.constants.X_OK);
+        return full;
+      }
+    } catch {
+      /* keep looking */
+    }
+  }
+  return null;
 }
 
 // Resolve a user-supplied path, following symlinks, and ensure the real path
@@ -156,11 +327,13 @@ async function loadState() {
   }
   return { sessions: raw.sessions || {}, history: Array.isArray(raw.history) ? raw.history : [] };
 }
-async function rememberSession(name, dir, uuid, permissionMode) {
+async function rememberSession(name, dir, uuid, permissionMode, sandbox = false, kvm = false) {
   const state = await loadState();
   state.sessions[sessionKey(name, dir)] = uuid;
   state.history = state.history.filter((e) => !(e.name === name && e.dir === dir));
-  state.history.unshift({ name, dir, uuid, permissionMode, lastUsed: Date.now() });
+  state.history.unshift({
+    name, dir, uuid, permissionMode, sandbox: !!sandbox, kvm: !!kvm, lastUsed: Date.now(),
+  });
   if (state.history.length > 50) state.history.length = 50;
   await writeJsonAtomic(STATE_FILE, state);
 }
@@ -170,11 +343,38 @@ async function lookupSession(name, dir) {
 }
 
 // Create the tmux session if it doesn't exist (also starts the server if dead).
+// Returns { created } — true when this call brought the session into being, so
+// the caller can offer to start autoclaude in a genuinely fresh session.
 async function ensureTmuxSession() {
   try {
     await tmux(['has-session', '-t', TMUX_SESSION]);
+    return { created: false };
   } catch {
     await tmux(['new-session', '-d', '-s', TMUX_SESSION]);
+    return { created: true };
+  }
+}
+
+async function tmuxSessionExists() {
+  try {
+    await tmux(['has-session', '-t', TMUX_SESSION]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Launch autoclaude as its own window in the target session, best-effort. Only
+// called when the binary resolved and the session was just created.
+async function startAutoclaudeWindow() {
+  const bin = binaryOnPath(AUTOCLAUDE_BIN);
+  if (!bin) return false;
+  try {
+    await tmux(['new-window', '-t', `${TMUX_SESSION}:`, '-n', 'autoclaude', bin]);
+    return true;
+  } catch (err) {
+    console.error(`starting autoclaude failed: ${(err.stderr || err.message || '').trim()}`);
+    return false;
   }
 }
 
@@ -230,6 +430,16 @@ async function listSessions(req, res) {
     '#{pane_title}',
     '#{window_active}',
     '#{window_activity}',
+    // User options we stamp on windows we create (empty for foreign windows).
+    // @cm_claude marks a Claude session even when its foreground process is
+    // `docker` (sandbox mode); @cm_sandbox flags that it's containerised.
+    '#{@cm_claude}',
+    '#{@cm_sandbox}',
+    // The command the pane was launched with — a robust fallback for windows
+    // created before we tagged them (e.g. an old sandbox window whose
+    // foreground process is `docker`, not `claude`). Kept last: it can contain
+    // spaces, and split('\t') caps at the fixed leading fields anyway.
+    '#{pane_start_command}',
   ].join('\t');
 
   let out;
@@ -247,7 +457,14 @@ async function listSessions(req, res) {
     .split('\n')
     .filter(Boolean)
     .map((line) => {
-      const [id, index, name, cmd, cwd, title, active, activity] = line.split('\t');
+      const [id, index, name, cmd, cwd, title, active, activity, cmClaude, cmSandbox, ...rest] =
+        line.split('\t');
+      // pane_start_command may itself contain tabs; rejoin the tail.
+      const startCmd = rest.join('\t');
+      // A sandbox window runs `docker`/`sg`, not `claude`. Recognise it from our
+      // tag, or (for windows created before tagging) from the start command.
+      const looksSandbox = /\bdocker\b/.test(startCmd) && /\brun\b/.test(startCmd);
+      const sandbox = cmSandbox === '1' || looksSandbox;
       return {
         id,
         index: parseInt(index, 10),
@@ -256,7 +473,8 @@ async function listSessions(req, res) {
         cwd,
         title,
         active: active === '1',
-        isClaude: cmd === 'claude',
+        isClaude: cmd === 'claude' || cmClaude === '1' || (looksSandbox && /\bclaude\b/.test(startCmd)),
+        sandbox,
         lastActivity: parseInt(activity, 10) || null,
       };
     });
@@ -270,13 +488,97 @@ async function listSessions(req, res) {
 const PERMISSION_MODES = new Set(['auto', 'default', 'acceptEdits', 'plan', 'bypassPermissions']);
 const DEFAULT_PERMISSION_MODE = 'auto';
 
-// POST /api/sessions — spawn a new Claude window.
-// body: { name, directory, resume?:bool, permissionMode?:string }
+// Build the trailing `claude …` arguments shared by host and sandbox modes:
+// remote control, permission handling, and resume/new-session targeting. The
+// resolved sessionId (existing or freshly minted) is returned alongside so the
+// caller can persist it.
+async function buildClaudeArgs(name, dir, resume, permissionMode, sandbox, kvm) {
+  const args = ['claude', '--remote-control', name];
+  if (permissionMode === 'bypassPermissions') {
+    args.push('--dangerously-skip-permissions');
+  } else {
+    args.push('--permission-mode', permissionMode);
+  }
+
+  let sessionId = null;
+  if (resume) {
+    sessionId = await lookupSession(name, dir);
+    // In a sandbox a remembered UUID only resumes if it was actually written to
+    // the volume; otherwise `--resume` fails and the window dies. Verify first.
+    if (sessionId && sandbox) {
+      const { homeVolume } = sandboxNames(name, dir);
+      if (!(await sandboxSessionSaved(homeVolume, sessionId))) sessionId = null;
+    }
+    if (sessionId) {
+      args.push('--resume', sessionId);
+      await rememberSession(name, dir, sessionId, permissionMode, sandbox, kvm); // refresh lastUsed
+    } else if (sandbox) {
+      // Nothing safely resumable in the volume — start a fresh session so the
+      // window always launches (a sandbox `--continue` would also hard-fail).
+      sessionId = crypto.randomUUID();
+      args.push('--session-id', sessionId);
+      await rememberSession(name, dir, sessionId, permissionMode, sandbox, kvm);
+    } else {
+      // Host: nothing remembered — fall back to "most recent in this directory".
+      args.push('--continue');
+    }
+  } else {
+    sessionId = crypto.randomUUID();
+    args.push('--session-id', sessionId);
+    await rememberSession(name, dir, sessionId, permissionMode, sandbox, kvm);
+  }
+  return { args, sessionId };
+}
+
+// The tmux window command for a sandboxed session: run claude inside a fresh
+// container (via `sg docker -c`), mounting the project at /workspace, the host
+// credentials read-only, and a persistent per-session volume for Claude's home
+// so resume works across container restarts. Inside the container cwd is always
+// /workspace, so `--session-id`/`--resume` args (from buildClaudeArgs) apply
+// there. Every field is shell-quoted by dockerCmd()/shq(), so the canonical
+// `dir` (which may contain spaces) and validated `name` can't inject.
+function sandboxWindowCmd(name, dir, claudeArgs, kvm) {
+  const { container, homeVolume } = sandboxNames(name, dir);
+  const runArgs = [
+    'run', '-it', '--rm',
+    '--name', container,
+    '--hostname', container,
+    '-v', `${dir}:/workspace`,
+  ];
+  if (CLAUDE_CREDS && fs.existsSync(CLAUDE_CREDS)) {
+    runArgs.push('-v', `${CLAUDE_CREDS}:/run/claude-creds/.credentials.json:ro`);
+  }
+  // Map /dev/kvm in and grant its owning group so the container's `pi` user can
+  // open it (device is mode 0660, group-owned).
+  if (kvm) {
+    const { available, gid } = kvmInfo();
+    if (available) {
+      runArgs.push('--device', KVM_DEVICE);
+      if (gid != null) runArgs.push('--group-add', String(gid));
+    }
+  }
+  runArgs.push(
+    '-v', `${homeVolume}:/home/youruser/.claude`,
+    '-w', '/workspace',
+    DOCKER_IMAGE,
+    // claudeArgs[0] === 'claude' — the container entrypoint runs it directly.
+    ...claudeArgs
+  );
+  return { cmd: dockerCmd(runArgs), container };
+}
+
+// POST /api/sessions — spawn a new Claude window (on the host, or in a Docker
+// sandbox when `sandbox` is set).
+// body: { name, directory, resume?:bool, permissionMode?:string,
+//         sandbox?:bool, startAutoclaude?:bool }
 async function createSession(req, res) {
   const body = await readBody(req);
   const name = String(body.name || '').trim();
   const directory = String(body.directory || '').trim();
   const resume = body.resume === true;
+  const sandbox = body.sandbox === true;
+  const kvm = body.kvm === true;
+  const startAutoclaude = body.startAutoclaude === true;
   const permissionMode = String(body.permissionMode || DEFAULT_PERMISSION_MODE).trim();
 
   if (!PERMISSION_MODES.has(permissionMode)) {
@@ -301,47 +603,51 @@ async function createSession(req, res) {
   }
 
   // Pre-seed the trust flag so the window doesn't block on the trust dialog.
-  // Best-effort: a failure here shouldn't stop us spawning.
+  // Best-effort: a failure here shouldn't stop us spawning. (Harmless in
+  // sandbox mode too — the container has its own home, but it costs nothing.)
   try {
     await ensureTrusted(dir);
   } catch (err) {
     console.error(`ensureTrusted(${dir}) failed: ${err.message}`);
   }
 
-  // Build the Claude command as discrete, already-validated arguments. tmux
-  // joins them into the window's command line; because `name` matches NAME_RE
-  // and `dir` is a canonical path inside an allowed root, nothing here can
-  // break out into the surrounding shell.
-  const claudeArgs = [CLAUDE_BIN, '--remote-control', name];
-  if (permissionMode === 'bypassPermissions') {
-    claudeArgs.push('--dangerously-skip-permissions');
-  } else {
-    claudeArgs.push('--permission-mode', permissionMode);
-  }
+  const { args: claudeArgs, sessionId } =
+    await buildClaudeArgs(name, dir, resume, permissionMode, sandbox, kvm);
 
-  // Resume targets a specific, remembered session UUID (no interactive picker).
-  // New sessions are created with a UUID we choose, then remembered so a later
-  // resume of the same name+dir lands on exactly this session.
-  let sessionId = null;
-  if (resume) {
-    sessionId = await lookupSession(name, dir);
-    if (sessionId) {
-      claudeArgs.push('--resume', sessionId);
-      await rememberSession(name, dir, sessionId, permissionMode); // refresh lastUsed
-    } else {
-      // Nothing remembered for this name+dir — fall back to "most recent in
-      // this directory", which also avoids the picker.
-      claudeArgs.push('--continue');
+  // Decide the window command. Host mode runs `claude` directly (claudeArgs
+  // start with the literal 'claude'; swap in the configured binary). Sandbox
+  // mode wraps it in a docker run. Because `name` matches NAME_RE and `dir` is
+  // a canonical path inside an allowed root, nothing here can break out.
+  let windowCmd;
+  let container = null;
+  if (sandbox) {
+    if (!(await dockerAvailable())) {
+      return sendJson(res, 503, {
+        error: 'Docker is not available (daemon unreachable or the service lacks docker-group access).',
+      });
     }
+    try {
+      await ensureDockerImage();
+    } catch (err) {
+      const msg = (err.stderr || err.message || '').trim();
+      return sendJson(res, 500, { error: `Building the sandbox image failed: ${msg}` });
+    }
+    // Clear any orphaned container of the same name from a previous run; the
+    // persistent home volume keeps the session history regardless.
+    ({ cmd: windowCmd, container } = sandboxWindowCmd(name, dir, claudeArgs, kvm));
+    await runDocker(['rm', '-f', container], { timeout: 20000 }).catch(() => {});
   } else {
-    sessionId = crypto.randomUUID();
-    claudeArgs.push('--session-id', sessionId);
-    await rememberSession(name, dir, sessionId, permissionMode);
+    windowCmd = [CLAUDE_BIN, ...claudeArgs.slice(1)];
   }
 
-  // Ensure the tmux session exists even if the server was restarted.
+  // Ensure the tmux session exists even if the server was restarted. If we just
+  // created it and the caller asked, launch autoclaude in the fresh session.
+  let autoclaudeStarted = false;
   try {
-    await ensureTmuxSession();
+    const { created } = await ensureTmuxSession();
+    if (created && startAutoclaude) {
+      autoclaudeStarted = await startAutoclaudeWindow();
+    }
   } catch (err) {
     return sendJson(res, 500, { error: `Could not start tmux session: ${err.message}` });
   }
@@ -359,7 +665,7 @@ async function createSession(req, res) {
         '-c', dir,
         '-P',
         '-F', '#{window_id}',
-        ...claudeArgs,
+        ...windowCmd,
       ])
     ).trim();
   } catch (err) {
@@ -367,28 +673,124 @@ async function createSession(req, res) {
     return sendJson(res, 500, { error: `tmux failed: ${msg}` });
   }
 
-  sendJson(res, 201, { ok: true, windowId, name, directory: dir, resume, sessionId, permissionMode });
+  // Mark the window as ours so the UI recognises it as a Claude session even in
+  // sandbox mode (foreground process `docker`) and can badge it. We also stash
+  // the container name so killing the window can tear the container down too.
+  // Best-effort.
+  try {
+    await tmux(['set-option', '-t', windowId, '-w', '@cm_claude', '1']);
+    await tmux(['set-option', '-t', windowId, '-w', '@cm_sandbox', sandbox ? '1' : '0']);
+    await tmux(['set-option', '-t', windowId, '-w', '@cm_kvm', sandbox && kvm ? '1' : '0']);
+    await tmux(['set-option', '-t', windowId, '-w', '@cm_container', container || '']);
+  } catch (err) {
+    console.error(`tagging window ${windowId} failed: ${(err.stderr || err.message || '').trim()}`);
+  }
+
+  sendJson(res, 201, {
+    ok: true, windowId, name, directory: dir, resume, sessionId, permissionMode,
+    sandbox, kvm: sandbox && kvm, container, autoclaudeStarted,
+  });
 }
 
-// POST /api/sessions/:windowId/kill — kill a window.
+// POST /api/sessions/:windowId/kill — kill a window (and its sandbox container,
+// if any). Removing the container is safe: the conversation history lives in the
+// persistent home volume and the project on the host bind-mount, neither of
+// which is touched — only the container instance is removed.
 async function killSession(req, res, windowId) {
   if (!/^@?\d+$/.test(windowId)) {
     return sendJson(res, 400, { error: 'Invalid window id.' });
   }
   const target = windowId.startsWith('@') ? windowId : `@${windowId}`;
+
+  // Figure out the container to tear down before killing the window (its options
+  // vanish with it). Prefer our @cm_container tag; for windows created before
+  // tagging, pull the name straight out of the pane's start command, which
+  // still carries the `--name claude-sandbox-…` we launched it with. A miss just
+  // means `docker rm` finds nothing — harmless.
+  let container = '';
+  try {
+    const out = await tmux([
+      'display-message', '-p', '-t', target,
+      '#{@cm_container}\t#{pane_start_command}',
+    ]);
+    // Split on the FIRST tab only (start command may contain tabs/anything), and
+    // don't .trim() — that would eat the leading empty field when the tag is
+    // unset and misalign the columns.
+    const nl = out.replace(/\r?\n$/, '');
+    const tab = nl.indexOf('\t');
+    const tagged = tab >= 0 ? nl.slice(0, tab) : '';
+    const startCmd = tab >= 0 ? nl.slice(tab + 1) : nl;
+    if (tagged) {
+      container = tagged;
+    } else {
+      // The command is shell-quoted (…'--name' 'claude-sandbox-x'…); drop quotes
+      // then grab the token after --name that we know is a sandbox container.
+      const m = startCmd.replace(/'/g, ' ').match(/--name\s+(claude-sandbox-\S+)/);
+      if (m) container = m[1];
+    }
+  } catch {
+    /* foreign window / older tmux — nothing to tear down */
+  }
+
   try {
     await tmux(['kill-window', '-t', target]);
   } catch (err) {
     const msg = (err.stderr || err.message || '').trim();
     return sendJson(res, 500, { error: `tmux failed: ${msg}` });
   }
-  sendJson(res, 200, { ok: true, killed: target });
+
+  let containerRemoved = false;
+  if (container) {
+    try {
+      await runDocker(['rm', '-f', container], { timeout: 20000 });
+      containerRemoved = true;
+    } catch (err) {
+      console.error(`removing container ${container} failed: ${(err.stderr || err.message || '').trim()}`);
+    }
+  }
+
+  sendJson(res, 200, { ok: true, killed: target, container: container || null, containerRemoved });
 }
 
 // GET /api/history — list remembered sessions, most recent first.
 async function listHistory(req, res) {
   const state = await loadState();
   sendJson(res, 200, { entries: state.history });
+}
+
+// GET /api/config — capabilities the UI uses to show/hide options. Docker and
+// tmux-session state are probed live so the UI reflects reality.
+async function getConfig(req, res) {
+  const dockerOk = await dockerAvailable();
+  const [imageReady, sessionExists] = await Promise.all([
+    dockerOk ? dockerImageExists() : Promise.resolve(false),
+    tmuxSessionExists(),
+  ]);
+  sendJson(res, 200, {
+    session: TMUX_SESSION,
+    roots: ALLOWED_ROOTS,
+    dockerAvailable: dockerOk,
+    dockerImageReady: imageReady,
+    dockerBuilding: buildInFlight !== null,
+    kvmAvailable: kvmInfo().available,
+    autoclaudeAvailable: binaryOnPath(AUTOCLAUDE_BIN) !== null,
+    sessionExists,
+  });
+}
+
+// POST /api/docker/build — build the sandbox image on demand (so the user can
+// pre-build with the UI rather than blocking the first session on it).
+async function buildDockerImage(req, res) {
+  if (!(await dockerAvailable())) {
+    return sendJson(res, 503, { error: 'Docker is not available.' });
+  }
+  try {
+    await ensureDockerImage();
+  } catch (err) {
+    const msg = (err.stderr || err.message || '').trim();
+    return sendJson(res, 500, { error: `Build failed: ${msg}` });
+  }
+  sendJson(res, 200, { ok: true, image: DOCKER_IMAGE });
 }
 
 // GET /api/browse?path=... — directory picker. Lists subdirectories.
@@ -527,9 +929,8 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/api/history' && req.method === 'GET') return await listHistory(req, res);
 
-    if (pathname === '/api/config' && req.method === 'GET') {
-      return sendJson(res, 200, { session: TMUX_SESSION, roots: ALLOWED_ROOTS });
-    }
+    if (pathname === '/api/config' && req.method === 'GET') return await getConfig(req, res);
+    if (pathname === '/api/docker/build' && req.method === 'POST') return await buildDockerImage(req, res);
 
     if (pathname.startsWith('/api/')) {
       return sendJson(res, 404, { error: 'Unknown endpoint' });
