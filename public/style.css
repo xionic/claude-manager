@@ -123,6 +123,9 @@ main { max-width: 920px; margin: 0 auto; padding: 22px; }
 .tag.claude { color: var(--accent); border-color: rgba(217,116,74,0.4); }
 .tag.docker { color: #7fb8e8; border-color: rgba(70,140,220,0.45); }
 .tag.warn { color: #f2c14e; border-color: rgba(242,193,78,0.45); }
+.tag.mem { color: var(--text-dim); border-color: var(--border); }
+.tag.mem.warn { color: #f2c14e; border-color: rgba(242,193,78,0.45); }
+.tag.mem.danger { color: #e5484d; border-color: rgba(229,72,77,0.5); }
 
 /* Kill + Restart stacked in a right-hand column (Kill on top). */
 .sw-actions { display: flex; flex-direction: column; gap: 6px; flex: none; }

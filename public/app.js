@@ -137,6 +137,7 @@ async function loadSessions() {
               ${escapeHtml(w.name)}
               ${w.isClaude ? '<span class="tag claude">claude</span>' : `<span class="tag">${escapeHtml(w.command)}</span>`}
               ${w.sandbox ? '<span class="tag docker">docker</span>' : ''}
+              ${memTag(w)}
               ${dcTag}
             </div>
             ${title ? `<div class="sw-title">${title}</div>` : ''}
@@ -149,6 +150,28 @@ async function loadSessions() {
         </div>`;
     })
     .join('');
+}
+
+// Human-readable memory size from bytes (e.g. 512 MB, 3.4 GB).
+function formatBytes(n) {
+  if (n == null || !isFinite(n)) return null;
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GB`;
+  return `${Math.round(n / 1024 ** 2)} MB`;
+}
+
+// Per-session memory badge. Turns amber past 4 GB and red past 8 GB so a
+// runaway session stands out before it can thrash the box. Sandbox sessions
+// report the pane's cgroup only (the container's memory lives elsewhere), so
+// their number undercounts — flag that in the tooltip rather than mislead.
+function memTag(w) {
+  const label = formatBytes(w.memoryBytes);
+  if (!label) return '';
+  const gb = w.memoryBytes / 1024 ** 3;
+  const cls = gb >= 8 ? ' danger' : gb >= 4 ? ' warn' : '';
+  const tip = w.sandbox
+    ? 'Host pane memory only — the sandbox container is not counted'
+    : 'Resident memory of this session and all its child processes';
+  return `<span class="tag mem${cls}" title="${tip}">${label}</span>`;
 }
 
 function escapeHtml(s) {

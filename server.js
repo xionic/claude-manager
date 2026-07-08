@@ -97,6 +97,16 @@ const CLAUDE_CONFIG =
 const STATE_FILE =
   process.env.CM_STATE_FILE || path.join(os.homedir(), '.claude-manager-sessions.json');
 
+// --- Memory history log ----------------------------------------------------
+// Periodic per-session memory samples appended to a TSV so you can go back and
+// see which session ate the RAM before a freeze. Columns:
+//   ISO-8601 time \t pid \t mem(MB) \t foreground-cmd \t window-name
+// Rotated to <file>.1 once it passes MEM_LOG_MAX_BYTES. Set the interval to 0
+// to disable logging entirely.
+const MEM_LOG = process.env.CM_MEM_LOG || path.join(os.homedir(), '.claude-manager-memory.log');
+const MEM_LOG_INTERVAL_MS = parseInt(process.env.CM_MEM_LOG_INTERVAL_MS || '60000', 10);
+const MEM_LOG_MAX_BYTES = parseInt(process.env.CM_MEM_LOG_MAX || String(5 * 1024 * 1024), 10);
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -111,6 +121,31 @@ function tmux(args) {
       resolve(stdout);
     });
   });
+}
+
+// Resident memory (bytes) of a tmux pane's whole process subtree, read from its
+// cgroup. Debian's tmux puts each pane in its own transient systemd scope
+// (tmux-spawn-<uuid>.scope), so that scope's memory.current is the exact live
+// total for the session — the claude process plus every child it spawns (bash,
+// tool subprocesses, subagents). This is what runs the box out of RAM, so it's
+// the number worth watching. Returns bytes, or null when it can't be read:
+// the pane just exited (race), or — for a sandbox session — the real work runs
+// in the container's own cgroup, not the pane's, so this undercounts those (the
+// pane only holds the small `docker run` client). cgroup v2 only.
+async function paneMemoryBytes(panePid) {
+  const pid = parseInt(panePid, 10);
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    // cgroup v2 gives a single "0::<path>" line for the process.
+    const cg = await fsp.readFile(`/proc/${pid}/cgroup`, 'utf8');
+    const m = cg.match(/^0::(.*)$/m);
+    if (!m) return null;
+    const memFile = path.join('/sys/fs/cgroup', m[1], 'memory.current');
+    const bytes = parseInt((await fsp.readFile(memFile, 'utf8')).trim(), 10);
+    return Number.isFinite(bytes) ? bytes : null;
+  } catch {
+    return null;
+  }
 }
 
 // Set of local pids that currently hold an established TLS (:443) connection —
@@ -243,6 +278,38 @@ async function sandboxSessionSaved(volume, uuid) {
   } catch {
     return false;
   }
+}
+
+// Map running-container name -> host init PID (State.Pid), for reading each
+// container's cgroup memory. One `docker ps` + one `docker inspect` over only
+// the running containers, so a stale/dead session name can never break the
+// batch (missing names simply won't appear). With the systemd cgroup driver the
+// init PID's cgroup is the container's own docker-<id>.scope, whose
+// memory.current is the full container total — the same metric paneMemoryBytes
+// reads for host panes. Empty map if docker is down or nothing is running.
+async function containerInitPids() {
+  const map = new Map();
+  try {
+    const ids = (await runDocker(['ps', '-q'], { timeout: 6000 }))
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!ids.length) return map;
+    const out = await runDocker(
+      ['inspect', '-f', '{{.Name}}\t{{.State.Pid}}', ...ids],
+      { timeout: 8000 }
+    );
+    for (const line of out.split('\n')) {
+      const tab = line.indexOf('\t');
+      if (tab < 0) continue;
+      const name = line.slice(0, tab).replace(/^\//, ''); // docker prefixes '/'
+      const pid = parseInt(line.slice(tab + 1), 10);
+      if (name && Number.isInteger(pid) && pid > 0) map.set(name, pid);
+    }
+  } catch {
+    /* docker unavailable / none running — undercount rather than fail */
+  }
+  return map;
 }
 
 // Resolve a bare command name to an absolute path on PATH (executable regular
@@ -450,8 +517,11 @@ function readBody(req) {
 // API handlers
 // ---------------------------------------------------------------------------
 
-// GET /api/sessions — list windows in the target tmux session.
-async function listSessions(req, res) {
+// Collect the windows in the target tmux session, with per-session memory.
+// Shared by the GET /api/sessions handler and the memory-history sampler.
+// Returns { session, available, windows, error? } and never throws for the
+// expected "no tmux server yet" case.
+async function gatherSessions() {
   // Use a tab-separated, controlled format so parsing is unambiguous.
   const FMT = [
     '#{window_id}',
@@ -470,6 +540,9 @@ async function listSessions(req, res) {
     // `docker` (sandbox mode); @cm_sandbox flags that it's containerised.
     '#{@cm_claude}',
     '#{@cm_sandbox}',
+    // The sandbox container name we stamped on creation. Lets us read the
+    // container's own cgroup for memory (the pane only holds the docker client).
+    '#{@cm_container}',
     // The command the pane was launched with — a robust fallback for windows
     // created before we tagged them (e.g. an old sandbox window whose
     // foreground process is `docker`, not `claude`). Kept last: it can contain
@@ -482,8 +555,12 @@ async function listSessions(req, res) {
     out = await tmux(['list-windows', '-t', TMUX_SESSION, '-F', FMT]);
   } catch (err) {
     const msg = (err.stderr || err.message || '').trim();
-    if (/can't find session|no server running|failed to connect/i.test(msg)) {
-      return sendJson(res, 200, { session: TMUX_SESSION, available: false, error: msg, windows: [] });
+    // "No server running" surfaces in a few different phrasings. After a reboot
+    // /tmp is wiped, so the socket file itself is gone and tmux says
+    // "error connecting to <socket> (No such file or directory)" — a distinct
+    // message that must also be treated as simply "no sessions yet", not a 500.
+    if (/can't find session|no server running|failed to connect|error connecting to|no such file or directory/i.test(msg)) {
+      return { session: TMUX_SESSION, available: false, error: msg, windows: [] };
     }
     throw err;
   }
@@ -495,7 +572,7 @@ async function listSessions(req, res) {
     .split('\n')
     .filter(Boolean)
     .map((line) => {
-      const [id, index, name, cmd, cwd, title, active, activity, panePid, cmClaude, cmSandbox, ...rest] =
+      const [id, index, name, cmd, cwd, title, active, activity, panePid, cmClaude, cmSandbox, cmContainer, ...rest] =
         line.split('\t');
       // pane_start_command may itself contain tabs; rejoin the tail.
       const startCmd = rest.join('\t');
@@ -503,6 +580,13 @@ async function listSessions(req, res) {
       // tag, or (for windows created before tagging) from the start command.
       const looksSandbox = /\bdocker\b/.test(startCmd) && /\brun\b/.test(startCmd);
       const sandbox = cmSandbox === '1' || looksSandbox;
+      // Container name: our tag, or (for pre-tag windows) parsed from --name in
+      // the start command — the same fallback killSession uses.
+      let container = cmContainer || '';
+      if (sandbox && !container) {
+        const m = startCmd.replace(/'/g, ' ').match(/--name\s+(claude-sandbox-\S+)/);
+        if (m) container = m[1];
+      }
       const isClaude = cmd === 'claude' || cmClaude === '1' || (looksSandbox && /\bclaude\b/.test(startCmd));
 
       // Is remote control actually connected? Only meaningful for a host claude
@@ -526,10 +610,34 @@ async function listSessions(req, res) {
         sandbox,
         remoteConnected,
         lastActivity: parseInt(activity, 10) || null,
+        pid: parseInt(panePid, 10) || null,
+        container: container || null,
       };
     });
 
-  sendJson(res, 200, { session: TMUX_SESSION, available: true, windows });
+  // Per-session memory (cgroup memory.current). Host sessions: read the pane's
+  // own scope. Sandbox sessions: the pane only holds the `docker run` client —
+  // the real work lives in the container's cgroup — so resolve each container's
+  // host init PID (one docker call for all of them) and read that scope instead.
+  const sandboxed = windows.filter((w) => w.sandbox && w.container);
+  const containerPids = sandboxed.length ? await containerInitPids() : new Map();
+  await Promise.all(
+    windows.map(async (w) => {
+      if (w.sandbox && w.container) {
+        const cpid = containerPids.get(w.container);
+        w.memoryBytes = cpid ? await paneMemoryBytes(cpid) : null;
+      } else {
+        w.memoryBytes = await paneMemoryBytes(w.pid);
+      }
+    })
+  );
+
+  return { session: TMUX_SESSION, available: true, windows };
+}
+
+// GET /api/sessions — list windows in the target tmux session.
+async function listSessions(req, res) {
+  sendJson(res, 200, await gatherSessions());
 }
 
 // Permission modes we expose, mapped to how they reach the claude CLI. All keys
@@ -962,6 +1070,44 @@ async function serveStatic(req, res, url) {
 // Router
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Memory history sampler
+// ---------------------------------------------------------------------------
+
+// Rename the log to <file>.1 once it grows past the cap, so history is bounded
+// (one generation kept). Best-effort — a failure just means we keep appending.
+async function rotateMemLogIfNeeded() {
+  try {
+    const st = await fsp.stat(MEM_LOG);
+    if (st.size > MEM_LOG_MAX_BYTES) await fsp.rename(MEM_LOG, `${MEM_LOG}.1`);
+  } catch {
+    /* no file yet, or rename lost a race — fine */
+  }
+}
+
+// Take one memory sample of every live window and append it. Skipped silently
+// when tmux isn't running or there are no windows (nothing to record).
+async function sampleMemoryOnce() {
+  let data;
+  try {
+    data = await gatherSessions();
+  } catch {
+    return; // unexpected tmux error — don't let the timer crash the process
+  }
+  if (!data.available || !data.windows.length) return;
+  const ts = new Date().toISOString();
+  const lines = data.windows.map((w) => {
+    const mb = w.memoryBytes != null ? (w.memoryBytes / 1048576).toFixed(1) : 'NA';
+    return `${ts}\t${w.pid || ''}\t${mb}\t${w.command}\t${w.name}`;
+  });
+  try {
+    await rotateMemLogIfNeeded();
+    await fsp.appendFile(MEM_LOG, lines.join('\n') + '\n');
+  } catch (err) {
+    console.error(`memory log write failed: ${err.message}`);
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const { pathname } = url;
@@ -999,4 +1145,10 @@ server.listen(PORT, BIND, () => {
   console.log(`  tmux socket : ${TMUX_SOCKET}`);
   console.log(`  tmux session: ${TMUX_SESSION}`);
   console.log(`  allowed roots: ${ALLOWED_ROOTS.join(', ')}`);
+  if (MEM_LOG_INTERVAL_MS > 0) {
+    console.log(`  memory log  : ${MEM_LOG} (every ${Math.round(MEM_LOG_INTERVAL_MS / 1000)}s)`);
+    // First sample shortly after start, then on the interval.
+    setTimeout(() => sampleMemoryOnce().catch(() => {}), 5000);
+    setInterval(() => sampleMemoryOnce().catch(() => {}), MEM_LOG_INTERVAL_MS);
+  }
 });
