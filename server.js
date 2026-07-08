@@ -52,6 +52,11 @@ const DOCKER_GROUP = process.env.CM_DOCKER_GROUP || 'docker';
 // We only offer to launch it when its binary resolves on PATH.
 const AUTOCLAUDE_BIN = process.env.CM_AUTOCLAUDE_BIN || 'autoclaude';
 
+// Binary used to inspect socket state, for the "remote control connected?"
+// check. Remote control is a persistent TLS connection to Anthropic; a window
+// whose claude has no established :443 connection is alive but disconnected.
+const SS_BIN = process.env.CM_SS_BIN || 'ss';
+
 // --- KVM passthrough ---
 // A sandbox session can opt in to hardware virtualisation (e.g. to boot an
 // x86_64 Android AVD) by mapping the host's /dev/kvm into the container. The
@@ -62,6 +67,14 @@ const KVM_DEVICE = process.env.CM_KVM_DEVICE || '/dev/kvm';
 const TMUX_SOCKET =
   process.env.CM_TMUX_SOCKET ||
   path.join(process.env.TMUX_TMPDIR || '/tmp', `tmux-${process.getuid()}`, 'default');
+// The socket a bare `tmux` uses. If we're on it, the copy-paste attach command
+// needs no `-S`; otherwise it must include one so the user reaches our server.
+const TMUX_SOCKET_DEFAULT = path.join(
+  process.env.TMUX_TMPDIR || '/tmp',
+  `tmux-${process.getuid()}`,
+  'default'
+);
+const TMUX_SOCKET_ARG = TMUX_SOCKET === TMUX_SOCKET_DEFAULT ? '' : `-S ${TMUX_SOCKET}`;
 
 const ALLOWED_ROOTS = (process.env.CM_ALLOWED_ROOTS || '/home/youruser,/var/www/html')
   .split(',')
@@ -96,6 +109,25 @@ function tmux(args) {
         return reject(err);
       }
       resolve(stdout);
+    });
+  });
+}
+
+// Set of local pids that currently hold an established TLS (:443) connection —
+// used to tell a genuinely remote-control-connected claude from one whose
+// process is alive but whose connection to Anthropic has dropped. Returns null
+// if ss is unavailable (so callers treat connectivity as "unknown", not "down").
+function connectedPids() {
+  return new Promise((resolve) => {
+    execFile(SS_BIN, ['-tnpH'], { timeout: 5000 }, (err, stdout) => {
+      if (err || !stdout) return resolve(null);
+      const pids = new Set();
+      for (const line of stdout.split('\n')) {
+        if (!line.includes('ESTAB') || !/:443\b/.test(line)) continue;
+        const matches = line.match(/pid=(\d+)/g);
+        if (matches) for (const m of matches) pids.add(parseInt(m.slice(4), 10));
+      }
+      resolve(pids);
     });
   });
 }
@@ -430,6 +462,9 @@ async function listSessions(req, res) {
     '#{pane_title}',
     '#{window_active}',
     '#{window_activity}',
+    // Pane pid — matched against the set of pids holding a live TLS connection
+    // to tell "remote control connected" from "process alive but disconnected".
+    '#{pane_pid}',
     // User options we stamp on windows we create (empty for foreign windows).
     // @cm_claude marks a Claude session even when its foreground process is
     // `docker` (sandbox mode); @cm_sandbox flags that it's containerised.
@@ -453,11 +488,14 @@ async function listSessions(req, res) {
     throw err;
   }
 
+  // Which pids currently hold a live TLS connection (null = ss unavailable).
+  const pidSet = await connectedPids();
+
   const windows = out
     .split('\n')
     .filter(Boolean)
     .map((line) => {
-      const [id, index, name, cmd, cwd, title, active, activity, cmClaude, cmSandbox, ...rest] =
+      const [id, index, name, cmd, cwd, title, active, activity, panePid, cmClaude, cmSandbox, ...rest] =
         line.split('\t');
       // pane_start_command may itself contain tabs; rejoin the tail.
       const startCmd = rest.join('\t');
@@ -465,6 +503,17 @@ async function listSessions(req, res) {
       // tag, or (for windows created before tagging) from the start command.
       const looksSandbox = /\bdocker\b/.test(startCmd) && /\brun\b/.test(startCmd);
       const sandbox = cmSandbox === '1' || looksSandbox;
+      const isClaude = cmd === 'claude' || cmClaude === '1' || (looksSandbox && /\bclaude\b/.test(startCmd));
+
+      // Is remote control actually connected? Only meaningful for a host claude
+      // (a sandbox's claude runs in the container's own net namespace, so its
+      // connection isn't owned by the pane pid) and only when ss succeeded.
+      // null = unknown; true = connected; false = process alive but disconnected.
+      let remoteConnected = null;
+      if (pidSet && isClaude && !sandbox) {
+        remoteConnected = pidSet.has(parseInt(panePid, 10));
+      }
+
       return {
         id,
         index: parseInt(index, 10),
@@ -473,8 +522,9 @@ async function listSessions(req, res) {
         cwd,
         title,
         active: active === '1',
-        isClaude: cmd === 'claude' || cmClaude === '1' || (looksSandbox && /\bclaude\b/.test(startCmd)),
+        isClaude,
         sandbox,
+        remoteConnected,
         lastActivity: parseInt(activity, 10) || null,
       };
     });
@@ -768,6 +818,7 @@ async function getConfig(req, res) {
   ]);
   sendJson(res, 200, {
     session: TMUX_SESSION,
+    socketArg: TMUX_SOCKET_ARG,
     roots: ALLOWED_ROOTS,
     dockerAvailable: dockerOk,
     dockerImageReady: imageReady,

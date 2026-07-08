@@ -51,7 +51,7 @@
         <label class="field">
           <span>Session name</span>
           <input id="f-name" type="text" placeholder="my-project" autocomplete="off" spellcheck="false" />
-          <small id="name-hint">Letters, numbers, dot, dash, underscore. Becomes the window name and remote-control id.</small>
+          <small id="name-hint">Letters, numbers, dot, dash, underscore. Spaces become hyphens. Becomes the window name and remote-control id.</small>
         </label>
 
         <label class="field">
@@ -123,6 +123,32 @@
         <div class="spacer"></div>
         <button type="button" class="btn" data-close-picker>Cancel</button>
         <button type="button" class="btn btn-primary" id="picker-select">Select this folder</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Attach-command dialog -->
+  <div id="attach" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-head">
+        <h2 id="attach-title">Attach in a terminal</h2>
+        <button class="icon-btn" data-close-attach>&times;</button>
+      </div>
+      <div class="attach-body">
+        <p class="attach-lead">Run this in a terminal to jump straight to this window:</p>
+        <div class="cmd-row">
+          <code id="attach-cmd" class="cmd"></code>
+          <button type="button" class="btn btn-primary" id="attach-copy">Copy</button>
+        </div>
+        <p class="attach-lead attach-alt-lead">Already inside tmux? Just switch to it:</p>
+        <div class="cmd-row">
+          <code id="attach-cmd-alt" class="cmd"></code>
+          <button type="button" class="btn" id="attach-copy-alt">Copy</button>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <div class="spacer"></div>
+        <button type="button" class="btn" data-close-attach>Close</button>
       </div>
     </div>
   </div>

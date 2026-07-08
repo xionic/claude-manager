@@ -11,6 +11,7 @@ let pickerCwd = null;
 let runningNames = new Set();
 let config = {};          // server capabilities (docker / autoclaude), loaded once
 let sessionExists = true;  // whether the tmux session is currently running
+let lastHistory = [];      // most-recent history entries (for restart params)
 
 // ---------------------------------------------------------------------------
 // API
@@ -114,12 +115,21 @@ async function loadSessions() {
 
   $('#sessions').innerHTML = windows
     .map((w) => {
-      const cls = ['session'];
+      const cls = ['session', 'clickable'];
       if (w.isClaude) cls.push('claude');
       if (w.active) cls.push('active');
+      const disconnected = w.remoteConnected === false;
+      if (disconnected) cls.push('disconnected');
       const title = w.title && w.title !== w.name ? escapeHtml(w.title) : '';
+      const dcTag = disconnected
+        ? '<span class="tag warn" title="Process is alive but its remote-control connection to Anthropic has dropped — not visible in the Claude app. Restart to re-register.">disconnected</span>'
+        : '';
+      // Restart (kill + resume) is available on every running session — it also
+      // covers docker/sandbox windows and cases where connectivity is unknown.
+      const restartBtn =
+        `<button class="btn${disconnected ? ' btn-restart-hi' : ''}" data-restart="${w.id}" data-rc-name="${escapeHtml(w.name)}" data-rc-cwd="${escapeHtml(w.cwd)}" data-rc-sandbox="${w.sandbox ? '1' : '0'}">Restart</button>`;
       return `
-        <div class="${cls.join(' ')}">
+        <div class="${cls.join(' ')}" data-win="${escapeHtml(w.id)}" data-win-name="${escapeHtml(w.name)}" title="Click for the tmux attach command">
           <span class="sw-status"></span>
           <div class="sw-main">
             <div class="sw-name">
@@ -127,11 +137,15 @@ async function loadSessions() {
               ${escapeHtml(w.name)}
               ${w.isClaude ? '<span class="tag claude">claude</span>' : `<span class="tag">${escapeHtml(w.command)}</span>`}
               ${w.sandbox ? '<span class="tag docker">docker</span>' : ''}
+              ${dcTag}
             </div>
             ${title ? `<div class="sw-title">${title}</div>` : ''}
             <div class="sw-cwd">${escapeHtml(w.cwd)}</div>
           </div>
-          <button class="btn btn-danger" data-kill="${w.id}" data-name="${escapeHtml(w.name)}">Kill</button>
+          <div class="sw-actions">
+            <button class="btn btn-danger" data-kill="${w.id}" data-name="${escapeHtml(w.name)}">Kill</button>
+            ${restartBtn}
+          </div>
         </div>`;
     })
     .join('');
@@ -141,6 +155,93 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
   );
+}
+
+// ---------------------------------------------------------------------------
+// Attach-command popup — how to reach a running window from a real terminal
+// ---------------------------------------------------------------------------
+
+// Build the tmux commands for a window id (e.g. "@11"). `socketArg` is empty for
+// the default socket, or "-S <path>" when the server uses a custom one. The `\;`
+// is the literal escape a shell needs so tmux gets `select-window` as a second
+// command; window ids are globally unique so `-t @11` is unambiguous.
+function attachCommands(windowId) {
+  const sock = config.socketArg ? `${config.socketArg} ` : '';
+  const sess = config.session ?? '0';
+  return {
+    full: `tmux ${sock}attach -t ${sess} \\; select-window -t ${windowId}`,
+    inside: `tmux ${sock}select-window -t ${windowId}`,
+  };
+}
+
+// Restart a session: kill the window (tearing down its container if it's a
+// sandbox) and re-launch it with resume, so a fresh claude re-registers remote
+// control on the same conversation. Works for host, docker, and unknown-state
+// windows alike. Params come from history (original launch dir + permission/
+// sandbox/kvm); we fall back to the window's own name/cwd if it isn't in history.
+async function restartSession(btn) {
+  const name = btn.dataset.rcName;
+  const entry = lastHistory.find((e) => e.name === name);
+  const directory = entry?.dir || btn.dataset.rcCwd;
+  const permissionMode = entry?.permissionMode || 'auto';
+  const sandbox = entry ? !!entry.sandbox : btn.dataset.rcSandbox === '1';
+  const kvm = entry ? !!entry.kvm : false;
+  const windowId = btn.dataset.restart;
+
+  if (!confirm(`Restart "${name}"? Its current process stops and a fresh one resumes the same conversation.`)) return;
+
+  btn.disabled = true;
+  btn.textContent = 'Restarting…';
+  try {
+    await api(`api/sessions/${encodeURIComponent(windowId)}/kill`, { method: 'POST' });
+    await api('api/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ name, directory, resume: true, permissionMode, sandbox, kvm }),
+    });
+    banner(`Restarted “${name}”.`, 'success');
+    await refresh();
+  } catch (err) {
+    banner(`Restart failed: ${err.message}`, 'error');
+    btn.disabled = false;
+    btn.textContent = 'Restart';
+  }
+}
+
+function openAttachModal(windowId, name) {
+  const { full, inside } = attachCommands(windowId);
+  $('#attach-title').textContent = `Attach to “${name}”`;
+  $('#attach-cmd').textContent = full;
+  $('#attach-cmd-alt').textContent = inside;
+  $('#attach').classList.remove('hidden');
+}
+function closeAttach() { $('#attach').classList.add('hidden'); }
+
+async function copyText(text, btn) {
+  const orig = btn.textContent;
+  let ok = false;
+  // Clipboard API needs a secure context (https); the LAN vhost is TLS, but plain
+  // http (localhost testing) is not — so fall back to the textarea+execCommand trick.
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    }
+  } catch { /* fall through to fallback */ }
+  if (!ok) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+    } catch { /* give up */ }
+  }
+  btn.textContent = ok ? 'Copied!' : 'Copy failed';
+  setTimeout(() => { btn.textContent = orig; }, 1500);
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +257,7 @@ async function loadHistory() {
   }
 
   const entries = data.entries || [];
+  lastHistory = entries; // remembered for the Restart action's params
   if (!entries.length) {
     $('#history').innerHTML = '<div class="empty">No recent sessions yet.</div>';
     return;
@@ -400,14 +502,39 @@ function init() {
   // Toggling the sandbox checkbox shows/hides the dependent KVM option.
   $('#f-docker').addEventListener('change', setupKvmField);
 
+  // Session names can't contain spaces (they become the tmux window / remote-
+  // control id), so turn them into hyphens as the user types. Space→hyphen is
+  // 1:1, so the caret position is preserved.
+  $('#f-name').addEventListener('input', (e) => {
+    const el = e.target;
+    if (el.value.includes(' ')) {
+      const pos = el.selectionStart;
+      el.value = el.value.replace(/ /g, '-');
+      el.setSelectionRange(pos, pos);
+    }
+  });
+
   // Close handlers
   document.querySelectorAll('[data-close]').forEach((el) => el.addEventListener('click', closeModal));
   document.querySelectorAll('[data-close-picker]').forEach((el) => el.addEventListener('click', closePicker));
+  document.querySelectorAll('[data-close-attach]').forEach((el) => el.addEventListener('click', closeAttach));
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { closeModal(); closePicker(); }
+    if (e.key === 'Escape') { closeModal(); closePicker(); closeAttach(); }
   });
   $('#modal').addEventListener('click', (e) => { if (e.target.id === 'modal') closeModal(); });
   $('#picker').addEventListener('click', (e) => { if (e.target.id === 'picker') closePicker(); });
+  $('#attach').addEventListener('click', (e) => { if (e.target.id === 'attach') closeAttach(); });
+
+  // Session row clicks: Restart button, or (on the row itself) the attach popup.
+  $('#sessions').addEventListener('click', (e) => {
+    const rc = e.target.closest('[data-restart]');
+    if (rc) { restartSession(rc); return; }
+    if (e.target.closest('button')) return; // Kill etc. have their own handlers
+    const row = e.target.closest('[data-win]');
+    if (row) openAttachModal(row.dataset.win, row.dataset.winName);
+  });
+  $('#attach-copy').addEventListener('click', (e) => copyText($('#attach-cmd').textContent, e.currentTarget));
+  $('#attach-copy-alt').addEventListener('click', (e) => copyText($('#attach-cmd-alt').textContent, e.currentTarget));
 
   // Picker open / navigate / select
   $('#pick-btn').addEventListener('click', () => openPicker($('#f-dir').value.trim() || null));
