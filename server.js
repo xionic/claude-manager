@@ -4,11 +4,11 @@
  * Claude Manager
  *
  * Small web service that manages Claude Code sessions living as tmux windows.
- * It runs AS the `pi` user (so it can talk to pi's tmux server natively) and
- * binds to localhost only. Apache sits in front for TLS, Basic auth and LAN
- * restriction. The service never sends prompts to Claude; it only spawns,
- * lists and kills windows. All spawn parameters are strictly validated so the
- * tmux command line can never be injected.
+ * It runs as the user that owns the tmux server (so it can talk to that server
+ * natively) and binds to localhost only. Put a reverse proxy in front for TLS,
+ * auth and LAN restriction. The service never sends prompts to Claude; it only
+ * spawns, lists and kills windows. All spawn parameters are strictly validated
+ * so the tmux command line can never be injected.
  */
 
 const http = require('http');
@@ -76,7 +76,7 @@ const TMUX_SOCKET_DEFAULT = path.join(
 );
 const TMUX_SOCKET_ARG = TMUX_SOCKET === TMUX_SOCKET_DEFAULT ? '' : `-S ${TMUX_SOCKET}`;
 
-const ALLOWED_ROOTS = (process.env.CM_ALLOWED_ROOTS || '/home/youruser,/var/www/html')
+const ALLOWED_ROOTS = (process.env.CM_ALLOWED_ROOTS || os.homedir())
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean)
@@ -269,8 +269,8 @@ async function sandboxSessionSaved(volume, uuid) {
   try {
     await runDocker(
       [
-        'run', '--rm', '-v', `${volume}:/home/youruser/.claude`, DOCKER_IMAGE,
-        'bash', '-lc', `ls /home/youruser/.claude/projects/*/${uuid}.jsonl >/dev/null 2>&1`,
+        'run', '--rm', '-v', `${volume}:/home/claude/.claude`, DOCKER_IMAGE,
+        'bash', '-lc', `ls /home/claude/.claude/projects/*/${uuid}.jsonl >/dev/null 2>&1`,
       ],
       { timeout: 20000 }
     );
@@ -706,8 +706,8 @@ function sandboxWindowCmd(name, dir, claudeArgs, kvm) {
   if (CLAUDE_CREDS && fs.existsSync(CLAUDE_CREDS)) {
     runArgs.push('-v', `${CLAUDE_CREDS}:/run/claude-creds/.credentials.json:ro`);
   }
-  // Map /dev/kvm in and grant its owning group so the container's `pi` user can
-  // open it (device is mode 0660, group-owned).
+  // Map /dev/kvm in and grant its owning group so the container user can open
+  // it (device is mode 0660, group-owned).
   if (kvm) {
     const { available, gid } = kvmInfo();
     if (available) {
@@ -716,7 +716,7 @@ function sandboxWindowCmd(name, dir, claudeArgs, kvm) {
     }
   }
   runArgs.push(
-    '-v', `${homeVolume}:/home/youruser/.claude`,
+    '-v', `${homeVolume}:/home/claude/.claude`,
     '-w', '/workspace',
     DOCKER_IMAGE,
     // claudeArgs[0] === 'claude' — the container entrypoint runs it directly.

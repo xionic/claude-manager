@@ -20,31 +20,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     file \
     && rm -rf /var/lib/apt/lists/*
 
-# Remap stock 'node' user (uid 1000) to 'pi'
+# Remap stock 'node' user (uid 1000) to 'claude'
 RUN userdel -r node 2>/dev/null || true \
-    && groupadd -g ${GID} pi \
-    && useradd -u ${UID} -g ${GID} -m -s /bin/bash pi
+    && groupadd -g ${GID} claude \
+    && useradd -u ${UID} -g ${GID} -m -s /bin/bash claude
 
-# Passwordless sudo for pi
-RUN echo 'pi ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/pi && chmod 440 /etc/sudoers.d/pi
+# Passwordless sudo for the container user
+RUN echo 'claude ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/claude && chmod 440 /etc/sudoers.d/claude
 
 # Install Claude Code globally
 RUN npm install -g @anthropic-ai/claude-code
 
-# claude is installed as root, so pi can't self-update at runtime; disabling the
-# auto-updater avoids a noisy "Auto-update failed" error inside every session.
+# claude is installed as root, so the container user can't self-update at
+# runtime; disabling the auto-updater avoids a noisy "Auto-update failed" error
+# inside every session.
 ENV DISABLE_AUTOUPDATER=1
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Pre-create a pi-owned ~/.claude so a fresh persistent volume mounted there is
-# initialised with pi ownership (Docker copies the image dir's ownership into an
-# empty named volume), letting the sandboxed Claude write its session history.
-RUN mkdir -p /workspace /run/claude-creds /home/youruser/.claude \
-    && chown pi:pi /workspace /home/youruser/.claude
+# Pre-create a claude-owned ~/.claude so a fresh persistent volume mounted there
+# is initialised with the right ownership (Docker copies the image dir's
+# ownership into an empty named volume), letting the sandboxed Claude write its
+# session history.
+RUN mkdir -p /workspace /run/claude-creds /home/claude/.claude \
+    && chown claude:claude /workspace /home/claude/.claude
 
-USER pi
+USER claude
 WORKDIR /workspace
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

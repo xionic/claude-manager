@@ -3,8 +3,8 @@ set -e
 
 # --- Claude home ---
 # When claude-manager mounts a persistent named volume at ~/.claude, an empty
-# volume is initialised root-owned, so `pi` can't write to it. Take ownership
-# (pi has passwordless sudo in this image) before touching it.
+# volume is initialised root-owned, so the container user can't write to it.
+# Take ownership (the container user has passwordless sudo here) before touching it.
 mkdir -p "$HOME/.claude" 2>/dev/null || true
 if [ "$(stat -c %u "$HOME/.claude" 2>/dev/null || echo 0)" != "$(id -u)" ]; then
     sudo chown -R "$(id -u):$(id -g)" "$HOME/.claude" 2>/dev/null || true

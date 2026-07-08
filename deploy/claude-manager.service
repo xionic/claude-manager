@@ -1,24 +1,28 @@
+# Example systemd unit. `deploy/install.sh` generates one tailored to your host
+# automatically; this file is for reference or manual installation. Replace
+# `youruser` with the account that owns the tmux server, then:
+#   sudo cp deploy/claude-manager.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now claude-manager
 [Unit]
 Description=Claude Manager (tmux session manager web UI)
 After=network.target
 
 [Service]
 Type=simple
-User=pi
-Group=pi
-WorkingDirectory=/home/youruser/projects/claude_manager
-ExecStart=/usr/bin/node /home/youruser/projects/claude_manager/server.js
+User=youruser
+WorkingDirectory=/home/youruser/claude-manager
+ExecStart=/usr/bin/node /home/youruser/claude-manager/server.js
 Restart=on-failure
 RestartSec=3
 
-# Make sure `claude` (in ~/.local/bin) and node resolve for spawned windows.
+# Make sure claude (in ~/.local/bin) and node resolve for spawned windows.
 Environment=PATH=/home/youruser/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=/home/youruser
 # App config (defaults shown; uncomment to override)
 Environment=CM_PORT=8765
 Environment=CM_BIND=127.0.0.1
 Environment=CM_TMUX_SESSION=0
-Environment=CM_ALLOWED_ROOTS=/home/youruser,/var/www/html
+Environment=CM_ALLOWED_ROOTS=/home/youruser
 
 [Install]
 WantedBy=multi-user.target

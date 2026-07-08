@@ -1,172 +1,192 @@
 # Claude Manager
 
-A small web interface to manage [Claude Code](https://claude.com/claude-code)
-sessions running as **tmux windows** — list them, kill them, and start new ones
-(name + directory picker, Remote Control enabled) without touching the terminal.
+A small web app for running [Claude Code](https://claude.com/claude-code)
+sessions inside **tmux**, from your browser.
 
-It pairs with [autoclaude](https://github.com/henryaj/autoclaude), which auto-
-continues sessions when the usage limit resets: this tool just creates and
-manages the windows; autoclaude keeps them going.
+Each session is a Claude process living in its own tmux window on a server. The
+web UI lets you start new ones (pick a name and a project directory), see the
+ones already running — including how much memory each is using — and stop or
+restart them, all without opening a terminal. When you do want a terminal, it
+shows you the exact `tmux attach` command to drop straight into any session.
 
-## How it's wired
+Because the sessions are plain tmux windows, they keep running after you close
+the browser, survive SSH disconnects, and you can attach to them from a real
+terminal whenever you like. The web app is just a convenient front door.
+
+## Why you'd use it
+
+- **Start Claude sessions from your phone or any browser** on your network, and
+  reconnect to them later from anywhere.
+- **See everything at a glance** — which sessions are alive, what directory each
+  is working in, whether each is still connected to Anthropic, and its live
+  memory footprint.
+- **Keep long-running sessions alive** on an always-on box (a home server, a
+  Raspberry Pi, a VPS) instead of tying them to your laptop.
+- **Optionally isolate a session in Docker** so Claude runs against one project
+  directory and nothing else on the machine.
+
+## How it works
 
 ```
-Browser ──TLS + Basic auth + LAN──> Apache (www-data) ──proxy──> Node service (runs as pi) ──> tmux
+Browser ──▶ (optional reverse proxy: TLS + auth) ──▶ Node service ──▶ tmux ──▶ claude
 ```
 
-The Node service **runs as the `pi` user**, so it talks to pi's tmux server
-natively — no sudo, no privilege bridge, no loosened permissions. It binds to
-`127.0.0.1` only; Apache is the front door (auth + LAN restriction). The service
-**never sends prompts** to Claude; it only spawns / lists / kills windows. Every
-spawn parameter is strictly validated (session name regex, directory canonicalised
-inside an allow-list) so the tmux command line can't be injected.
+The Node service binds to `127.0.0.1` only and talks to the tmux server of the
+user it runs as — no root, no privilege bridge. It never sends prompts to
+Claude; it only creates, lists, and kills tmux windows. Every value it hands to
+tmux is validated first (session names match a strict pattern, directories are
+resolved and confined to an allow-list), so the tmux command line can't be
+injected.
 
-New sessions are launched exactly like you do by hand:
+Starting a session runs the same command you would type by hand:
 
 ```
-tmux new-window -t 0 -n <name> -c <dir> claude --remote-control <name> \
+tmux new-window -n <name> -c <dir> claude --remote-control <name> \
   (--permission-mode <auto|default|acceptEdits|plan> | --dangerously-skip-permissions) [--resume]
 ```
 
-The permission mode is chosen per session in the **New session** dialog
-(default **auto**); picking "Dangerously skip all permissions" uses
-`--dangerously-skip-permissions`, every other mode maps to `--permission-mode`.
+`--remote-control` registers the session with the Claude app so you can also
+drive it from your phone; the permission mode is chosen per session in the UI.
 
-## Docker sandbox sessions
+## Requirements
 
-The **New session** dialog has a **Run in Docker sandbox** toggle. When on, the
-tmux window doesn't run `claude` on the host — it runs it *inside a container*
-built from [`docker/`](docker/) (`Dockerfile` + `entrypoint.sh`), with:
+- Linux with **cgroup v2** (standard on current distros — needed for the
+  per-session memory readout).
+- **Node.js 18+**.
+- **tmux**.
+- The **`claude`** CLI on the service user's `PATH`
+  ([install Claude Code](https://claude.com/claude-code)).
+- *(Optional)* **Docker**, only if you want sandboxed sessions.
 
-- the chosen project directory mounted at `/workspace` (the container sees
-  **nothing else** of the host filesystem),
-- your host `~/.claude/.credentials.json` mounted read-only so it's already
-  authenticated,
-- a persistent per-session Docker **volume** for the container's `~/.claude`, so
-  `--resume` lands on the same conversation across restarts.
-
-The window command is `sg docker -c "docker run -it --rm … claude …"`. It's
-wrapped in `sg docker` because the daemon socket is only reachable by the
-`docker` group, and the long-running tmux server may have started before that
-membership existed; `sg` applies the group per-invocation so no tmux/service
-restart is needed. Every field is shell-quoted, so a directory name with spaces
-can't inject.
-
-The first sandbox session builds the `claude-sandbox:latest` image (a few
-minutes). You can pre-build it from the dialog's **Build now** link, or the
-server builds it lazily on first use. The toggle is disabled with a hint if the
-server can't reach Docker.
-
-**KVM (hardware virtualisation).** When the sandbox toggle is on *and* the host
-has `/dev/kvm`, a nested **Enable KVM** option appears. It adds
-`--device /dev/kvm --group-add <kvm gid>` to the container so a sandboxed session
-can use hardware acceleration — e.g. booting an x86_64 Android AVD. The
-`--group-add` is required: `/dev/kvm` is mode `0660` and group-owned, so without
-it the container's `pi` user can see the device but can't open it. The image
-ships build tools but **not** the Android SDK/emulator — install those in-session
-or bake them in. KVM access is a mild loosening of the sandbox, so it's opt-in
-per session (and remembered on resume).
-
-> Requirements: Docker installed, and the service's user in the `docker` group
-> (`sudo usermod -aG docker <user>`; restart the service so it re-reads groups).
-
-## autoclaude
-
-When the manager has to **create the tmux session from scratch** (it wasn't
-running yet) and an `autoclaude` binary is on the service's `PATH`, the dialog
-offers **"Also start autoclaude in the new tmux session"** (a resume from the
-history panel asks the same via a confirm). If accepted, autoclaude is launched
-as its own `autoclaude` window in the fresh session. The option stays hidden
-when the binary isn't found or the session already exists.
-
-## Configuration (env vars)
-
-| Var                 | Default                  | Meaning                                  |
-|---------------------|--------------------------|------------------------------------------|
-| `CM_PORT`           | `8765`                   | Port the Node service listens on         |
-| `CM_BIND`           | `127.0.0.1`              | Bind address (keep localhost)            |
-| `CM_TMUX_SESSION`   | `0`                      | tmux session new windows are created in  |
-| `CM_ALLOWED_ROOTS`  | `/home/youruser,/var/www/html` | Comma-separated dir-picker roots (jail)  |
-| `CM_TMUX_BIN`       | `/usr/bin/tmux`          | tmux binary                              |
-| `CM_CLAUDE_BIN`     | `claude`                 | claude binary (resolved in window env)   |
-| `CM_TMUX_SOCKET`    | `/tmp/tmux-<uid>/default`| tmux socket path                         |
-| `CM_DOCKER_BIN`     | `docker`                 | docker binary                            |
-| `CM_DOCKER_IMAGE`   | `claude-sandbox:latest`  | sandbox image tag                        |
-| `CM_DOCKER_DIR`     | `<app>/docker`           | build context (Dockerfile lives here)    |
-| `CM_CLAUDE_CREDS`   | `~/.claude/.credentials.json` | creds mounted into the sandbox      |
-| `CM_SG_BIN`         | `sg`                     | group-switch wrapper for docker calls    |
-| `CM_DOCKER_GROUP`   | `docker`                 | group that can reach the docker socket   |
-| `CM_AUTOCLAUDE_BIN` | `autoclaude`             | autoclaude binary (offered if on PATH)   |
-| `CM_KVM_DEVICE`     | `/dev/kvm`               | KVM device passed through when enabled    |
-
-## Run it manually (to test)
+## Install
 
 ```bash
-cd /home/youruser/projects/claude_manager
+git clone https://github.com/xionic/claude-manager.git
+cd claude-manager
+sudo ./deploy/install.sh
+```
+
+The installer sets up and starts a systemd service that runs as the user who
+invoked `sudo` (so it uses that user's tmux server), then prints the local URL.
+By default it exposes the app on `127.0.0.1:8765` only. It is idempotent — re-run
+it any time, e.g. after pulling changes.
+
+Then open <http://localhost:8765/> (or tunnel to it over SSH). To reach it from
+other devices, put a reverse proxy in front — see
+[Exposing it on your network](#exposing-it-on-your-network).
+
+### Run it directly (no service)
+
+```bash
 node server.js
-# then, in another terminal:
+# in another terminal:
 curl -s localhost:8765/api/sessions | jq
 ```
 
-Open http://localhost:8765/ directly while testing.
+## Configuration
 
-## Quick install (does everything)
+All configuration is via environment variables (set them in the systemd unit,
+or in your shell when running directly).
+
+| Variable            | Default                       | Purpose                                          |
+|---------------------|-------------------------------|--------------------------------------------------|
+| `CM_PORT`           | `8765`                        | Port the service listens on                      |
+| `CM_BIND`           | `127.0.0.1`                   | Bind address (keep it on localhost)              |
+| `CM_TMUX_SESSION`   | `0`                           | tmux session new windows are created in          |
+| `CM_ALLOWED_ROOTS`  | `$HOME`                       | Comma-separated roots the directory picker is confined to |
+| `CM_TMUX_BIN`       | `/usr/bin/tmux`               | tmux binary                                      |
+| `CM_CLAUDE_BIN`     | `claude`                      | claude binary (resolved on the service's PATH)   |
+| `CM_TMUX_SOCKET`    | `/tmp/tmux-<uid>/default`     | tmux socket path                                 |
+| `CM_MEM_LOG`        | `~/.claude-manager-memory.log`| Per-session memory history log (set interval to 0 to disable) |
+| `CM_MEM_LOG_INTERVAL_MS` | `60000`                  | How often to sample session memory               |
+| `CM_DOCKER_IMAGE`   | `claude-sandbox:latest`       | Image tag for sandboxed sessions                 |
+| `CM_CLAUDE_CREDS`   | `~/.claude/.credentials.json` | Credentials mounted into a sandbox               |
+| `CM_KVM_DEVICE`     | `/dev/kvm`                    | KVM device passed through when enabled           |
+
+## Using it
+
+**Start a session.** Click **+ New session**, give it a name, browse to a
+project directory, pick a permission mode, and start. The session appears in the
+list and, if you've registered remote control, in the Claude app too.
+
+**Watch memory.** Each running session shows its live memory use (the Claude
+process and everything it spawns). The badge turns amber past 4 GB and red past
+8 GB, so a runaway session is easy to spot. A rolling history is also written to
+the memory log for after-the-fact diagnosis.
+
+**Attach from a terminal.** Click a session to get the `tmux attach` command
+that jumps straight to that window.
+
+**Restart a session.** If a session's connection to Anthropic drops (it shows as
+*disconnected*), **Restart** kills and re-launches it, resuming the same
+conversation.
+
+## Docker sandbox sessions
+
+The **New session** dialog has a **Run in Docker sandbox** toggle. With it on,
+the tmux window runs Claude *inside a container* built from [`docker/`](docker/)
+rather than directly on the host. The container gets:
+
+- the chosen project directory mounted at `/workspace` — and nothing else of the
+  host filesystem;
+- your `~/.claude/.credentials.json` mounted read-only, so it's already signed in;
+- a persistent per-session Docker volume for the container's home, so `--resume`
+  returns to the same conversation across restarts.
+
+The first sandbox session builds the image (a few minutes); you can also
+pre-build it from the dialog. The toggle is disabled if the service can't reach
+Docker.
+
+**KVM (hardware virtualisation).** If the sandbox toggle is on *and* the host has
+`/dev/kvm`, an **Enable KVM** option appears. It maps the device into the
+container (adding its owning group so the container user can open it) — useful
+for, say, booting an x86_64 Android emulator inside the sandbox. It's opt-in per
+session because it slightly widens what the container can touch. The image ships
+build tools but not the Android SDK; install that in-session if you need it.
+
+> To use sandboxes the service user must be in the `docker` group
+> (`sudo usermod -aG docker <user>`, then restart the service). Docker calls are
+> wrapped in `sg docker` so group membership applies even if the tmux server was
+> started before the user joined the group.
+
+## Exposing it on your network
+
+The service is deliberately localhost-only. To reach it from other devices, run
+a reverse proxy that adds TLS and authentication in front of it. Any proxy works
+(Caddy, nginx, Apache); an example Apache config is in
+[`deploy/apache-claude-manager.conf`](deploy/apache-claude-manager.conf), and the
+installer can set Apache up for you:
 
 ```bash
-sudo /home/youruser/projects/claude_manager/deploy/install.sh
+sudo WITH_APACHE=1 ./deploy/install.sh
 ```
 
-This installs + starts the systemd service, enables the Apache modules, prompts
-for a Basic-auth password, installs the reverse-proxy config, validates the
-Apache config (and refuses to reload if it's broken), and prints the URL. It is
-idempotent — re-run it any time. Non-interactive variant:
+That enables the needed Apache modules, prompts for a Basic-auth password, and
+installs a proxy config that serves the app at `https://<your-host>/claude-manager/`,
+restricted to your LAN. Adjust the `Require ip` line to match your subnet (add
+your Tailscale range, `100.64.0.0/10`, if you use it).
 
-```bash
-sudo AUTH_USER=youruser AUTH_PASS='your-pw' /home/youruser/projects/claude_manager/deploy/install.sh
-```
+Whatever proxy you choose: **keep it behind authentication and off the public
+internet.**
 
-Afterwards, review the `Require ip` line in `/etc/apache2/conf-available/claude-manager.conf`
-if your LAN isn't `192.168.x` / `10.x` (add your Tailscale range there too).
+## Companion: autoclaude
 
-The manual steps below are equivalent, if you'd rather do them by hand.
-
-## Install as a service
-
-```bash
-sudo cp deploy/claude-manager.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now claude-manager
-sudo systemctl status claude-manager
-journalctl -u claude-manager -f       # logs
-```
-
-> Note: the systemd unit runs as a normal system service with `User=pi`. It
-> reaches the tmux server pi already has running at `/tmp/tmux-1000/default`.
-> That tmux server must be running (your existing attached session) for new
-> windows to appear in it.
-
-## Put Apache in front
-
-```bash
-# 1. Enable the needed modules
-sudo a2enmod proxy proxy_http auth_basic authn_file authz_host
-
-# 2. Create the Basic-auth user
-sudo htpasswd -c /etc/apache2/claude-manager.htpasswd youruser
-
-# 3. Add the proxy block to a vhost (see deploy/apache-claude-manager.conf),
-#    e.g. paste it inside the SSL vhost, then:
-sudo systemctl reload apache2
-```
-
-Visit `https://<your-pi>/claude-manager/`.
+Claude Code pauses when you hit a usage limit. [autoclaude](https://github.com/xionic/autoclaude)
+watches for the reset and continues sessions automatically. Claude Manager just
+manages the windows; autoclaude keeps them moving. If an `autoclaude` binary is
+on the service's `PATH`, the New-session dialog offers to launch it in its own
+window when it creates the tmux session.
 
 ## Security notes
 
-- Starting a session launches `claude` **as pi** in the chosen permission mode.
-  The "Dangerously skip all permissions" option runs Claude with no permission
-  checks, so treat access as equivalent to a shell login for the `pi` user —
-  keep it behind auth and on the LAN/Tailscale only, never public.
-- The dir picker is jailed to `CM_ALLOWED_ROOTS` with symlinks resolved; paths
-  outside are rejected (403).
-- Session names are limited to `[A-Za-z0-9._-]{1,64}`.
+- Starting a session runs `claude` as the service user in the permission mode you
+  pick. **Dangerously skip all permissions** runs with no permission checks —
+  treat access to this app as equivalent to a shell login for that user. Keep it
+  authenticated and on your LAN only.
+- The directory picker is confined to `CM_ALLOWED_ROOTS`, with symlinks resolved;
+  anything outside is rejected.
+- Session names are limited to `[A-Za-z0-9._-]` (1–64 characters).
+
+## License
+
+MIT

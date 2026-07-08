@@ -1,32 +1,36 @@
 #!/usr/bin/env bash
 #
-# Claude Manager — one-shot installer. Run with sudo:
+# Claude Manager — installer. Run with sudo from the repo:
 #
-#     sudo /home/youruser/projects/claude_manager/deploy/install.sh
+#     sudo ./deploy/install.sh
 #
-# It is idempotent: safe to re-run after pulling changes. It installs the
-# systemd service (running as the app user), enables the needed Apache modules,
-# sets up Basic auth, installs the reverse-proxy config, validates the Apache
-# config, and reloads. Nothing is touched if the Apache config test fails.
+# It installs and starts a systemd service that runs as the user who invoked
+# sudo (so it uses that user's tmux server), listening on localhost only. It is
+# idempotent: safe to re-run after pulling changes.
+#
+# By default it does NOT touch your web server — the app stays on 127.0.0.1. To
+# also put Apache in front (TLS/auth reverse proxy on your LAN), pass
+# WITH_APACHE=1.
 #
 # Optional env overrides:
-#   APP_USER=pi            user the service runs as (owns the tmux server)
-#   APP_DIR=/home/youruser/projects/claude_manager
-#   AUTH_USER=youruser         Basic-auth username
-#   AUTH_PASS=...          set to install non-interactively (else prompted)
-#   PORT=8765
-#   HTPASSWD_FILE=/etc/apache2/.htpasswd
-#                          point at an existing file to reuse it (user must
-#                          already exist in it — the script won't touch the file
-#                          or prompt for a password)
+#   APP_USER=<user>       user the service runs as (default: the sudo caller)
+#   APP_DIR=<path>        repo location (default: this script's parent repo)
+#   PORT=8765             port the service listens on
+#   ALLOWED_ROOTS=<dirs>  comma-separated directory-picker roots (default: user home)
+#   WITH_APACHE=1         also configure the Apache reverse proxy (see below)
+#   AUTH_USER=<user>      Basic-auth username for Apache (default: APP_USER)
+#   AUTH_PASS=...         set to configure Apache non-interactively (else prompted)
+#   HTPASSWD_FILE=/etc/apache2/claude-manager.htpasswd
 set -euo pipefail
 
-APP_USER="${APP_USER:-pi}"
-APP_DIR="${APP_DIR:-/home/youruser/projects/claude_manager}"
-AUTH_USER="${AUTH_USER:-youruser}"
+# ---- resolve defaults ------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_USER="${APP_USER:-${SUDO_USER:-$(logname 2>/dev/null || echo root)}}"
+APP_DIR="${APP_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 PORT="${PORT:-8765}"
-HTPASSWD_FILE="${HTPASSWD_FILE:-/etc/apache2/.htpasswd}"
-SERVICE_SRC="$APP_DIR/deploy/claude-manager.service"
+WITH_APACHE="${WITH_APACHE:-0}"
+AUTH_USER="${AUTH_USER:-$APP_USER}"
+HTPASSWD_FILE="${HTPASSWD_FILE:-/etc/apache2/claude-manager.htpasswd}"
 SERVICE_DST="/etc/systemd/system/claude-manager.service"
 CONF_DST="/etc/apache2/conf-available/claude-manager.conf"
 
@@ -44,28 +48,51 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 step "Preflight checks"
-id "$APP_USER" >/dev/null 2>&1 || { c_err "user '$APP_USER' does not exist"; exit 1; }
+id "$APP_USER" >/dev/null 2>&1 || { c_err "user '$APP_USER' does not exist (set APP_USER=)"; exit 1; }
 c_ok "app user: $APP_USER"
+
+APP_HOME="$(getent passwd "$APP_USER" | cut -d: -f6)"
+[[ -n "$APP_HOME" ]] || { c_err "could not determine home directory for $APP_USER"; exit 1; }
+ALLOWED_ROOTS="${ALLOWED_ROOTS:-$APP_HOME}"
 
 [[ -f "$APP_DIR/server.js" ]] || { c_err "server.js not found in $APP_DIR"; exit 1; }
 c_ok "app dir: $APP_DIR"
 
-[[ -f "$SERVICE_SRC" ]] || { c_err "service unit not found: $SERVICE_SRC"; exit 1; }
+NODE_BIN="$(command -v node || true)"
+[[ -n "$NODE_BIN" ]] || { c_err "node is not installed"; exit 1; }
+c_ok "node: $("$NODE_BIN" --version) ($NODE_BIN)"
 
-command -v node >/dev/null || { c_err "node is not installed"; exit 1; }
-c_ok "node: $(node --version)"
+command -v tmux >/dev/null || { c_err "tmux is not installed"; exit 1; }
+c_ok "tmux present"
 
-command -v apache2ctl >/dev/null || command -v apachectl >/dev/null \
-  || { c_err "apache2 does not appear to be installed"; exit 1; }
-APACHECTL="$(command -v apache2ctl || command -v apachectl)"
-
-command -v htpasswd >/dev/null || { c_err "htpasswd missing — install apache2-utils"; exit 1; }
-c_ok "apache tooling present"
-
-# ---- systemd service -------------------------------------------------------
+# ---- systemd service (generated for this host) -----------------------------
 step "Installing systemd service"
-install -m 0644 "$SERVICE_SRC" "$SERVICE_DST"
-c_ok "copied unit -> $SERVICE_DST"
+cat > "$SERVICE_DST" <<EOF
+[Unit]
+Description=Claude Manager (tmux session manager web UI)
+After=network.target
+
+[Service]
+Type=simple
+User=$APP_USER
+WorkingDirectory=$APP_DIR
+ExecStart=$NODE_BIN $APP_DIR/server.js
+Restart=on-failure
+RestartSec=3
+
+# Make sure claude (typically in ~/.local/bin) and node resolve for spawned windows.
+Environment=PATH=$APP_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=$APP_HOME
+Environment=CM_PORT=$PORT
+Environment=CM_BIND=127.0.0.1
+Environment=CM_TMUX_SESSION=0
+Environment=CM_ALLOWED_ROOTS=$ALLOWED_ROOTS
+
+[Install]
+WantedBy=multi-user.target
+EOF
+c_ok "wrote $SERVICE_DST (User=$APP_USER, roots=$ALLOWED_ROOTS)"
+
 systemctl daemon-reload
 systemctl enable claude-manager >/dev/null 2>&1 || true
 systemctl restart claude-manager
@@ -78,45 +105,37 @@ else
   exit 1
 fi
 
-# ---- Apache modules --------------------------------------------------------
-step "Enabling Apache modules"
-a2enmod proxy proxy_http auth_basic authn_file authz_host >/dev/null
-c_ok "proxy, proxy_http, auth_basic, authn_file, authz_host enabled"
+# ---- optional: Apache reverse proxy ----------------------------------------
+if [[ "$WITH_APACHE" == "1" ]]; then
+  step "Configuring Apache reverse proxy"
 
-# ---- Basic auth user -------------------------------------------------------
-step "Basic-auth credentials"
-if [[ -f "$HTPASSWD_FILE" ]] && grep -q "^${AUTH_USER}:" "$HTPASSWD_FILE" 2>/dev/null; then
-  # User already in file — leave it alone (works for shared files like .htpasswd
-  # that belong to other vhosts and may have different ownership).
-  c_ok "user '$AUTH_USER' found in $HTPASSWD_FILE — reusing it"
-  c_info "to change the password:  sudo htpasswd $HTPASSWD_FILE $AUTH_USER"
-else
-  # File is new (needs -c) or user is absent. Create/add and lock down perms.
-  if [[ -n "${AUTH_PASS:-}" ]]; then
-    if [[ -f "$HTPASSWD_FILE" ]]; then
-      htpasswd -bB "$HTPASSWD_FILE" "$AUTH_USER" "$AUTH_PASS" >/dev/null
-    else
-      htpasswd -cbB "$HTPASSWD_FILE" "$AUTH_USER" "$AUTH_PASS" >/dev/null
-    fi
-    c_ok "set password for '$AUTH_USER' (non-interactive)"
+  command -v apache2ctl >/dev/null || command -v apachectl >/dev/null \
+    || { c_err "apache2 not found — install it or omit WITH_APACHE=1"; exit 1; }
+  APACHECTL="$(command -v apache2ctl || command -v apachectl)"
+  command -v htpasswd >/dev/null || { c_err "htpasswd missing — install apache2-utils"; exit 1; }
+
+  a2enmod proxy proxy_http auth_basic authn_file authz_host >/dev/null
+  c_ok "enabled proxy / auth modules"
+
+  # Basic-auth user
+  if [[ -f "$HTPASSWD_FILE" ]] && grep -q "^${AUTH_USER}:" "$HTPASSWD_FILE" 2>/dev/null; then
+    c_ok "user '$AUTH_USER' already in $HTPASSWD_FILE — reusing it"
   else
-    c_info "Enter a password for Basic-auth user '$AUTH_USER':"
-    if [[ -f "$HTPASSWD_FILE" ]]; then
-      htpasswd -B "$HTPASSWD_FILE" "$AUTH_USER"
+    if [[ -n "${AUTH_PASS:-}" ]]; then
+      [[ -f "$HTPASSWD_FILE" ]] && htpasswd -bB "$HTPASSWD_FILE" "$AUTH_USER" "$AUTH_PASS" >/dev/null \
+                                || htpasswd -cbB "$HTPASSWD_FILE" "$AUTH_USER" "$AUTH_PASS" >/dev/null
+      c_ok "set password for '$AUTH_USER' (non-interactive)"
     else
-      htpasswd -cB "$HTPASSWD_FILE" "$AUTH_USER"
+      c_info "Enter a Basic-auth password for '$AUTH_USER':"
+      [[ -f "$HTPASSWD_FILE" ]] && htpasswd -B "$HTPASSWD_FILE" "$AUTH_USER" \
+                                || htpasswd -cB "$HTPASSWD_FILE" "$AUTH_USER"
+      c_ok "credentials saved"
     fi
-    c_ok "credentials saved"
+    chown root:www-data "$HTPASSWD_FILE" 2>/dev/null || true
+    chmod 0640 "$HTPASSWD_FILE"
   fi
-  chown root:www-data "$HTPASSWD_FILE"
-  chmod 0640 "$HTPASSWD_FILE"
-fi
 
-# ---- Apache reverse-proxy config ------------------------------------------
-step "Installing Apache reverse-proxy config"
-# Written as a global conf-available file so it applies to all vhosts
-# (including the SSL vhost) without editing them.
-cat > "$CONF_DST" <<EOF
+  cat > "$CONF_DST" <<EOF
 # Claude Manager — installed by deploy/install.sh. Edit the Require ip line to
 # match your LAN/Tailscale, then: sudo systemctl reload apache2
 <Location /claude-manager/>
@@ -136,28 +155,29 @@ cat > "$CONF_DST" <<EOF
 
 RedirectMatch ^/claude-manager\$ /claude-manager/
 EOF
-c_ok "wrote $CONF_DST"
-a2enconf claude-manager >/dev/null
-c_ok "enabled conf"
+  a2enconf claude-manager >/dev/null
+  c_ok "wrote $CONF_DST"
 
-# ---- validate + reload -----------------------------------------------------
-step "Validating Apache configuration"
-if "$APACHECTL" configtest; then
-  c_ok "config test passed"
-  systemctl reload apache2
-  c_ok "apache reloaded"
-else
-  c_err "apache configtest FAILED — not reloading. Disabling our conf to be safe."
-  a2disconf claude-manager >/dev/null 2>&1 || true
-  exit 1
+  if "$APACHECTL" configtest; then
+    systemctl reload apache2
+    c_ok "apache config valid — reloaded"
+  else
+    c_err "apache configtest FAILED — disabling our conf and leaving apache untouched"
+    a2disconf claude-manager >/dev/null 2>&1 || true
+    exit 1
+  fi
 fi
 
 # ---- done ------------------------------------------------------------------
 step "Done"
-HOST="$(hostname -I 2>/dev/null | awk '{print $1}')"
 c_ok "Service:  http://127.0.0.1:${PORT}/  (localhost only)"
-c_ok "Public:   https://${HOST:-<your-pi>}/claude-manager/  (Basic auth, LAN only)"
-echo
+if [[ "$WITH_APACHE" == "1" ]]; then
+  HOST="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  c_ok "Proxied:  https://${HOST:-<your-host>}/claude-manager/  (Basic auth, LAN only)"
+  c_warn "Check the 'Require ip' line in $CONF_DST if your LAN isn't 192.168/10.x."
+else
+  c_info "To reach it from other devices, put a reverse proxy in front — or re-run"
+  c_info "with WITH_APACHE=1 to set up Apache. See the README."
+fi
 c_info "Logs:     journalctl -u claude-manager -f"
 c_info "Restart:  sudo systemctl restart claude-manager"
-c_warn "Review the 'Require ip' line in $CONF_DST if your LAN isn't 192.168/10.x."

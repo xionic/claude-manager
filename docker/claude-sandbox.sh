@@ -19,8 +19,8 @@ Options:
   --rm <name>             Remove the named sandbox container
 
 Example:
-  $(basename "$0") my-project /home/youruser/projects/my-project
-  $(basename "$0") my-project /home/youruser/projects/my-project --prompt-file /tmp/task.txt
+  $(basename "$0") my-project ~/projects/my-project
+  $(basename "$0") my-project ~/projects/my-project --prompt-file /tmp/task.txt
 EOF
 }
 
