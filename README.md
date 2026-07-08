@@ -13,6 +13,8 @@ Because the sessions are plain tmux windows, they keep running after you close
 the browser, survive SSH disconnects, and you can attach to them from a real
 terminal whenever you like. The web app is just a convenient front door.
 
+![The Claude Manager dashboard: running sessions with live memory, working directory, and Kill/Restart controls](docs/dashboard.png)
+
 ## Why you'd use it
 
 - **Start Claude sessions from your phone or any browser** on your network, and
@@ -108,6 +110,10 @@ or in your shell when running directly).
 **Start a session.** Click **+ New session**, give it a name, browse to a
 project directory, pick a permission mode, and start. The session appears in the
 list and, if you've registered remote control, in the Claude app too.
+
+| New session | Directory picker |
+|---|---|
+| ![New session dialog](docs/new-session.png) | ![Directory picker confined to the allowed roots](docs/directory-picker.png) |
 
 **Watch memory.** Each running session shows its live memory use (the Claude
 process and everything it spawns). The badge turns amber past 4 GB and red past
