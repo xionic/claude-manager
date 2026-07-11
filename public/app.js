@@ -12,6 +12,10 @@ let runningNames = new Set();
 let config = {};          // server capabilities (docker / autoclaude), loaded once
 let sessionExists = true;  // whether the tmux session is currently running
 let lastHistory = [];      // most-recent history entries (for restart params)
+let lastSessionsData = null; // last /api/sessions response (for re-render on search)
+let searchQuery = '';      // lowercased name filter for both panels
+
+const matchesSearch = (name) => !searchQuery || String(name).toLowerCase().includes(searchQuery);
 
 // ---------------------------------------------------------------------------
 // API
@@ -92,24 +96,36 @@ async function loadSessions() {
   }
 
   clearErrorBanner(); // fetch recovered
+  lastSessionsData = data;
   $('#session-label').textContent = `session ${data.session}`;
   sessionExists = data.available;
+  runningNames = new Set(data.available ? (data.windows || []).map((w) => w.name) : []);
+  renderRunning();
+}
+
+// Render the running-windows panel from the last fetch, applying the Claude-only
+// toggle and the name search. Split from loadSessions so search re-renders
+// without refetching (which would re-run ss/tmux each keystroke).
+function renderRunning() {
+  const data = lastSessionsData;
+  if (!data) return;
 
   if (!data.available) {
-    runningNames = new Set();
     $('#sessions').innerHTML =
-      `<div class="empty">tmux session <b>${data.session}</b> is not running.<br>` +
+      `<div class="empty">tmux session <b>${escapeHtml(data.session)}</b> is not running.<br>` +
       `<small>Tap <b>Resume</b> on a recent session below — tmux will start automatically.</small></div>`;
     return;
   }
 
-  runningNames = new Set((data.windows || []).map((w) => w.name));
-
-  let windows = data.windows;
+  let windows = data.windows || [];
   if (claudeOnly) windows = windows.filter((w) => w.isClaude);
+  if (searchQuery) windows = windows.filter((w) => matchesSearch(w.name));
 
   if (!windows.length) {
-    $('#sessions').innerHTML = `<div class="empty">No ${claudeOnly ? 'Claude ' : ''}windows yet. Start one with <b>+ New session</b>.</div>`;
+    const msg = searchQuery
+      ? 'No running sessions match your search.'
+      : `No ${claudeOnly ? 'Claude ' : ''}windows yet. Start one with <b>+ New session</b>.`;
+    $('#sessions').innerHTML = `<div class="empty">${msg}</div>`;
     return;
   }
 
@@ -278,27 +294,36 @@ async function loadHistory() {
   } catch {
     data = { entries: [] };
   }
+  lastHistory = data.entries || []; // remembered for the Restart action's params
+  renderRecent();
+}
 
-  const entries = data.entries || [];
-  lastHistory = entries; // remembered for the Restart action's params
+// Render the Recent-sessions panel. Currently-running sessions live in the top
+// panel, so they're excluded here to avoid showing them twice; then the name
+// search is applied.
+function renderRecent() {
+  let entries = (lastHistory || []).filter((e) => !runningNames.has(e.name));
+  if (searchQuery) entries = entries.filter((e) => matchesSearch(e.name));
+
   if (!entries.length) {
-    $('#history').innerHTML = '<div class="empty">No recent sessions yet.</div>';
+    const msg = searchQuery
+      ? 'No recent sessions match your search.'
+      : 'No recent sessions.';
+    $('#history').innerHTML = `<div class="empty">${msg}</div>`;
     return;
   }
 
   $('#history').innerHTML = entries
     .map((e) => {
-      const running = runningNames.has(e.name);
-      const cls = ['session', 'h-session', running ? 'claude active' : ''].filter(Boolean).join(' ');
       const permLabel = e.permissionMode || 'auto';
       const sandboxTag = e.sandbox ? '<span class="tag docker">docker</span>' : '';
       return `
-        <div class="${cls}">
+        <div class="session h-session">
           <span class="sw-status"></span>
           <div class="sw-main">
             <div class="sw-name">
               ${escapeHtml(e.name)}
-              <span class="tag ${running ? 'claude' : ''}">${running ? 'running' : escapeHtml(permLabel)}</span>
+              <span class="tag">${escapeHtml(permLabel)}</span>
               ${sandboxTag}
             </div>
             <div class="sw-cwd">${escapeHtml(e.dir)}</div>
@@ -311,7 +336,7 @@ async function loadHistory() {
               data-h-perm="${escapeHtml(permLabel)}"
               data-h-sandbox="${e.sandbox ? '1' : '0'}"
               data-h-kvm="${e.kvm ? '1' : '0'}"
-            >${running ? 'Open again' : 'Resume'}</button>
+            >Resume</button>
           </div>
         </div>`;
     })
@@ -422,6 +447,13 @@ async function submitNew(e) {
     $('#name-hint').textContent = 'Invalid: use 1-64 chars — letters, numbers, dot, dash, underscore.';
     return;
   }
+  // A new session can't reuse a running window's name (the server also enforces
+  // this); catch it here for instant feedback. Resume is exempt.
+  if (!resume && runningNames.has(name)) {
+    $('#name-hint').classList.add('bad');
+    $('#name-hint').textContent = `A session named "${name}" is already running. Pick a different name.`;
+    return;
+  }
   if (!directory) {
     banner('Pick a directory first.', 'warn');
     return;
@@ -515,7 +547,14 @@ function init() {
   $('#new-btn').addEventListener('click', openModal);
   $('#refresh-btn').addEventListener('click', refresh);
   $('#new-form').addEventListener('submit', submitNew);
-  $('#claude-only').addEventListener('change', (e) => { claudeOnly = e.target.checked; refresh(); });
+  $('#claude-only').addEventListener('change', (e) => { claudeOnly = e.target.checked; renderRunning(); });
+
+  // Search filters both panels from cached data — no refetch per keystroke.
+  $('#search').addEventListener('input', (e) => {
+    searchQuery = e.target.value.trim().toLowerCase();
+    renderRunning();
+    renderRecent();
+  });
 
   // "Build now" inside the Docker hint (delegated — the button is re-rendered).
   $('#docker-hint').addEventListener('click', (e) => {

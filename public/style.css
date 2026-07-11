@@ -87,6 +87,21 @@ main { max-width: 920px; margin: 0 auto; padding: 22px; }
 .panel-actions { display: flex; align-items: center; gap: 14px; }
 .toggle { font-size: 13px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
 
+/* Search bar */
+.searchbar { margin-bottom: 16px; }
+.searchbar input {
+  width: 100%;
+  font-family: var(--sans);
+  font-size: 14px;
+  color: var(--text);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+}
+.searchbar input::placeholder { color: var(--text-dim); }
+.searchbar input:focus { outline: none; border-color: var(--accent); }
+
 #sessions { padding: 8px; }
 
 /* Session card */

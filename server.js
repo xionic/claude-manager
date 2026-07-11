@@ -35,10 +35,20 @@ const CLAUDE_BIN = process.env.CM_CLAUDE_BIN || 'claude';
 const DOCKER_BIN = process.env.CM_DOCKER_BIN || 'docker';
 const DOCKER_IMAGE = process.env.CM_DOCKER_IMAGE || 'claude-sandbox:latest';
 const DOCKER_DIR = process.env.CM_DOCKER_DIR || path.join(__dirname, 'docker');
+// The unprivileged user (and its home) inside the sandbox image — must match
+// docker/Dockerfile. Centralised so the volume mount, resume check and
+// credential sync can never drift apart again (as they did when the image user
+// was renamed pi → claude but the image wasn't rebuilt).
+const SANDBOX_USER = process.env.CM_SANDBOX_USER || 'claude';
+const SANDBOX_HOME = process.env.CM_SANDBOX_HOME || `/home/${SANDBOX_USER}`;
 // The host credentials file mounted read-only into the container so the
 // sandboxed Claude is already authenticated. Empty string disables the mount.
 const CLAUDE_CREDS =
   process.env.CM_CLAUDE_CREDS || path.join(os.homedir(), '.claude', '.credentials.json');
+// How often (minutes) to copy the host credentials into running sandbox
+// containers, so their isolated copy never goes stale and Claude inside doesn't
+// get logged out when the host rotates the OAuth token. 0 disables the sync.
+const CREDS_SYNC_MIN = parseInt(process.env.CM_CREDS_SYNC_MIN || '15', 10);
 // The daemon socket is only reachable by members of the `docker` group. The
 // long-running tmux server (and possibly this service) may have been started
 // before that membership existed, so every docker invocation — ours and the
@@ -234,6 +244,45 @@ function ensureDockerImage() {
   return buildInFlight;
 }
 
+// Names of the sandbox containers we run that are currently up.
+async function listSandboxContainers() {
+  try {
+    const out = await runDocker(
+      ['ps', '--filter', 'name=claude-sandbox-', '--format', '{{.Names}}'],
+      { timeout: 10000 }
+    );
+    return out.split('\n').map((s) => s.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+// Copy the host's current credentials into every running sandbox container so
+// their isolated ~/.claude copy tracks the host and Claude inside stays logged
+// in. `docker cp` writes into the container's own fs (unlike a bind mount, it
+// isn't defeated by the atomic-rename the credentials writer uses). Host file is
+// uid 1000 (== the container's `pi`), so ownership carries over; we still fix it
+// defensively in case docker cp lands it as root.
+async function syncCredsToSandboxes() {
+  if (!CLAUDE_CREDS || !fs.existsSync(CLAUDE_CREDS)) return 0;
+  const containers = await listSandboxContainers();
+  let ok = 0;
+  for (const c of containers) {
+    try {
+      await runDocker(['cp', CLAUDE_CREDS, `${c}:${SANDBOX_HOME}/.claude/.credentials.json`], { timeout: 15000 });
+      await runDocker(
+        ['exec', '-u', 'root', c, 'chown', `${SANDBOX_USER}:${SANDBOX_USER}`, `${SANDBOX_HOME}/.claude/.credentials.json`],
+        { timeout: 10000 }
+      ).catch(() => {});
+      ok++;
+    } catch (err) {
+      console.error(`creds sync -> ${c} failed: ${(err.stderr || err.message || '').trim()}`);
+    }
+  }
+  if (ok) console.log(`[creds] synced credentials into ${ok} sandbox container(s)`);
+  return ok;
+}
+
 // Is /dev/kvm present on the host, and what group owns it? Returns
 // { available, gid } — gid is the numeric group needed as a supplementary group
 // so the container's non-root user can open the device.
@@ -269,8 +318,8 @@ async function sandboxSessionSaved(volume, uuid) {
   try {
     await runDocker(
       [
-        'run', '--rm', '-v', `${volume}:/home/claude/.claude`, DOCKER_IMAGE,
-        'bash', '-lc', `ls /home/claude/.claude/projects/*/${uuid}.jsonl >/dev/null 2>&1`,
+        'run', '--rm', '-v', `${volume}:${SANDBOX_HOME}/.claude`, DOCKER_IMAGE,
+        'bash', '-lc', `ls ${SANDBOX_HOME}/.claude/projects/*/${uuid}.jsonl >/dev/null 2>&1`,
       ],
       { timeout: 20000 }
     );
@@ -716,7 +765,7 @@ function sandboxWindowCmd(name, dir, claudeArgs, kvm) {
     }
   }
   runArgs.push(
-    '-v', `${homeVolume}:/home/claude/.claude`,
+    '-v', `${homeVolume}:${SANDBOX_HOME}/.claude`,
     '-w', '/workspace',
     DOCKER_IMAGE,
     // claudeArgs[0] === 'claude' — the container entrypoint runs it directly.
@@ -758,6 +807,23 @@ async function createSession(req, res) {
     dir = await resolveWithinRoots(directory, true);
   } catch (err) {
     return sendJson(res, err.statusCode || 400, { error: err.message });
+  }
+
+  // Reject a duplicate name for a brand-new session — two running windows sharing
+  // one name would both answer to the same remote-control id. Resume flows re-use
+  // the name on purpose (restart kills the old window first), so they're exempt.
+  if (!resume) {
+    try {
+      const running = (await tmux(['list-windows', '-t', TMUX_SESSION, '-F', '#{window_name}']))
+        .split('\n').map((s) => s.trim()).filter(Boolean);
+      if (running.includes(name)) {
+        return sendJson(res, 409, {
+          error: `A session named "${name}" is already running. Pick a different name, or resume it from Recent.`,
+        });
+      }
+    } catch {
+      /* no tmux session yet → nothing running → no possible duplicate */
+    }
   }
 
   // Pre-seed the trust flag so the window doesn't block on the trust dialog.
@@ -1150,5 +1216,10 @@ server.listen(PORT, BIND, () => {
     // First sample shortly after start, then on the interval.
     setTimeout(() => sampleMemoryOnce().catch(() => {}), 5000);
     setInterval(() => sampleMemoryOnce().catch(() => {}), MEM_LOG_INTERVAL_MS);
+  }
+  if (CREDS_SYNC_MIN > 0) {
+    console.log(`  creds sync  : sandbox containers every ${CREDS_SYNC_MIN} min`);
+    setTimeout(() => syncCredsToSandboxes().catch(() => {}), 20000);
+    setInterval(() => syncCredsToSandboxes().catch(() => {}), CREDS_SYNC_MIN * 60 * 1000);
   }
 });
