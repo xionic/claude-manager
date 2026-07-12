@@ -1,39 +1,19 @@
 #!/bin/bash
 set -e
 
-# --- Claude home ---
-# When claude-manager mounts a persistent named volume at ~/.claude, an empty
-# volume is initialised root-owned, so the container user can't write to it.
-# Take ownership (the container user has passwordless sudo here) before touching it.
-mkdir -p "$HOME/.claude" 2>/dev/null || true
-if [ "$(stat -c %u "$HOME/.claude" 2>/dev/null || echo 0)" != "$(id -u)" ]; then
-    sudo chown -R "$(id -u):$(id -g)" "$HOME/.claude" 2>/dev/null || true
-fi
+# ~/.claude is bind-mounted from the host (shared credentials + session history),
+# owned by the same uid as the container user — so no credential copy or ownership
+# fixup is needed, and we must NOT chown or reseed settings inside it (that's the
+# host's live directory).
 
-# --- Auth setup ---
-CREDS_SRC="/run/claude-creds/.credentials.json"
-if [ -f "$CREDS_SRC" ]; then
-    cp "$CREDS_SRC" "$HOME/.claude/.credentials.json"
-    chmod 600 "$HOME/.claude/.credentials.json"
-fi
-
-# --- Seed settings so no interactive prompts block the session ---
-mkdir -p "$HOME/.claude"
-
-SETTINGS="$HOME/.claude/settings.json"
-if [ ! -f "$SETTINGS" ]; then
-    echo '{}' > "$SETTINGS"
-fi
-jq '. + {"skipDangerousModePermissionPrompt": true, "theme": "dark"}' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
-
+# Pre-accept onboarding and the "Do you trust this folder?" dialog for /workspace
+# in the container-local ~/.claude.json. This file lives in $HOME, NOT under the
+# shared ~/.claude, so seeding it doesn't touch host state — it just stops the
+# container's Claude blocking on the trust prompt. Mirrors ensureTrusted().
 CLAUDE_JSON="$HOME/.claude.json"
 if [ ! -f "$CLAUDE_JSON" ]; then
     echo '{}' > "$CLAUDE_JSON"
 fi
-# Pre-accept onboarding AND the per-project "Do you trust this folder?" dialog
-# for /workspace (the project is always mounted there). Without this the
-# container's Claude blocks on the trust prompt and never starts / registers
-# remote control. Mirrors ensureTrusted() on the host.
 jq '. + {"hasCompletedOnboarding": true, "dontCrawlDirectory": false}
     | .projects = (.projects // {})
     | .projects["/workspace"] = ((.projects["/workspace"] // {}) + {

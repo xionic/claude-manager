@@ -102,7 +102,7 @@ or in your shell when running directly).
 | `CM_MEM_LOG`        | `~/.claude-manager-memory.log`| Per-session memory history log (set interval to 0 to disable) |
 | `CM_MEM_LOG_INTERVAL_MS` | `60000`                  | How often to sample session memory               |
 | `CM_DOCKER_IMAGE`   | `claude-sandbox:latest`       | Image tag for sandboxed sessions                 |
-| `CM_CLAUDE_CREDS`   | `~/.claude/.credentials.json` | Credentials mounted into a sandbox               |
+| `CM_HOST_CLAUDE_DIR`| `~/.claude`                   | Host Claude dir bind-mounted live into a sandbox |
 | `CM_KVM_DEVICE`     | `/dev/kvm`                    | KVM device passed through when enabled           |
 
 ## Using it
@@ -133,11 +133,15 @@ The **New session** dialog has a **Run in Docker sandbox** toggle. With it on,
 the tmux window runs Claude *inside a container* built from [`docker/`](docker/)
 rather than directly on the host. The container gets:
 
-- the chosen project directory mounted at `/workspace` — and nothing else of the
-  host filesystem;
-- your `~/.claude/.credentials.json` mounted read-only, so it's already signed in;
-- a persistent per-session Docker volume for the container's home, so `--resume`
-  returns to the same conversation across restarts.
+- the chosen project directory mounted at `/workspace`;
+- the host's `~/.claude` directory mounted live, so the container **shares the
+  host's credentials and session history**. Sharing the real credential file (not
+  an isolated copy) puts the container on the host's single OAuth refresh chain —
+  so a token refresh by the container is seen by every host session and vice
+  versa, which is what prevents the containers from rotating the token out of sync
+  and logging everyone out. Conversations are shared too (sandboxes are for an
+  isolated *install* environment, not isolated history); they file under
+  `~/.claude/projects/-workspace/` since the container's cwd is always `/workspace`.
 
 The first sandbox session builds the image (a few minutes); you can also
 pre-build it from the dialog. The toggle is disabled if the service can't reach

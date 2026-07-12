@@ -28,8 +28,12 @@ RUN userdel -r node 2>/dev/null || true \
 # Passwordless sudo for the container user
 RUN echo 'claude ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/claude && chmod 440 /etc/sudoers.d/claude
 
-# Install Claude Code globally
-RUN npm install -g @anthropic-ai/claude-code
+# Install Claude Code globally. The in-container auto-updater is disabled (see
+# below), so the image build is the ONLY way Claude advances — pin to @latest and
+# use a cache-bust arg so a rebuild always pulls the current version instead of
+# reusing a stale cached layer. claude-manager passes a fresh CLAUDE_CACHE_BUST.
+ARG CLAUDE_CACHE_BUST=0
+RUN npm install -g @anthropic-ai/claude-code@latest
 
 # claude is installed as root, so the container user can't self-update at
 # runtime; disabling the auto-updater avoids a noisy "Auto-update failed" error

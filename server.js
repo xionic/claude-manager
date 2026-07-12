@@ -41,14 +41,12 @@ const DOCKER_DIR = process.env.CM_DOCKER_DIR || path.join(__dirname, 'docker');
 // was renamed pi → claude but the image wasn't rebuilt).
 const SANDBOX_USER = process.env.CM_SANDBOX_USER || 'claude';
 const SANDBOX_HOME = process.env.CM_SANDBOX_HOME || `/home/${SANDBOX_USER}`;
-// The host credentials file mounted read-only into the container so the
-// sandboxed Claude is already authenticated. Empty string disables the mount.
-const CLAUDE_CREDS =
-  process.env.CM_CLAUDE_CREDS || path.join(os.homedir(), '.claude', '.credentials.json');
-// How often (minutes) to copy the host credentials into running sandbox
-// containers, so their isolated copy never goes stale and Claude inside doesn't
-// get logged out when the host rotates the OAuth token. 0 disables the sync.
-const CREDS_SYNC_MIN = parseInt(process.env.CM_CREDS_SYNC_MIN || '15', 10);
+// The host's ~/.claude directory, bind-mounted live into sandbox containers so
+// the containerised Claude shares the host's credentials (one OAuth refresh
+// chain — no isolated copy to rotate out of sync and trigger logouts) and its
+// session history. Conversation history is intentionally shared, not isolated.
+const HOST_CLAUDE_DIR =
+  process.env.CM_HOST_CLAUDE_DIR || path.join(os.homedir(), '.claude');
 // The daemon socket is only reachable by members of the `docker` group. The
 // long-running tmux server (and possibly this service) may have been started
 // before that membership existed, so every docker invocation — ours and the
@@ -228,59 +226,25 @@ async function dockerImageExists() {
   }
 }
 
-// Build claude-sandbox:latest from docker/. Slow (minutes) on first run, so the
-// timeout is generous. Only called when the image is missing.
+// Build claude-sandbox:latest from docker/. Slow (minutes), so the timeout is
+// generous. The CLAUDE_CACHE_BUST arg forces the claude-code install layer to
+// re-run so the image always picks up the current version. `force` rebuilds even
+// when the image already exists (to update Claude in a stale image).
 let buildInFlight = null;
-function ensureDockerImage() {
+function ensureDockerImage(force = false) {
   if (buildInFlight) return buildInFlight;
   buildInFlight = (async () => {
-    if (await dockerImageExists()) return;
+    if (!force && (await dockerImageExists())) return;
     console.log(`[docker] building ${DOCKER_IMAGE} from ${DOCKER_DIR} …`);
-    await runDocker(['build', '-t', DOCKER_IMAGE, DOCKER_DIR], { timeout: 20 * 60 * 1000 });
+    await runDocker(
+      ['build', '--build-arg', `CLAUDE_CACHE_BUST=${Date.now()}`, '-t', DOCKER_IMAGE, DOCKER_DIR],
+      { timeout: 20 * 60 * 1000 }
+    );
     console.log(`[docker] built ${DOCKER_IMAGE}`);
   })().finally(() => {
     buildInFlight = null;
   });
   return buildInFlight;
-}
-
-// Names of the sandbox containers we run that are currently up.
-async function listSandboxContainers() {
-  try {
-    const out = await runDocker(
-      ['ps', '--filter', 'name=claude-sandbox-', '--format', '{{.Names}}'],
-      { timeout: 10000 }
-    );
-    return out.split('\n').map((s) => s.trim()).filter(Boolean);
-  } catch {
-    return [];
-  }
-}
-
-// Copy the host's current credentials into every running sandbox container so
-// their isolated ~/.claude copy tracks the host and Claude inside stays logged
-// in. `docker cp` writes into the container's own fs (unlike a bind mount, it
-// isn't defeated by the atomic-rename the credentials writer uses). Host file is
-// uid 1000 (== the container's `pi`), so ownership carries over; we still fix it
-// defensively in case docker cp lands it as root.
-async function syncCredsToSandboxes() {
-  if (!CLAUDE_CREDS || !fs.existsSync(CLAUDE_CREDS)) return 0;
-  const containers = await listSandboxContainers();
-  let ok = 0;
-  for (const c of containers) {
-    try {
-      await runDocker(['cp', CLAUDE_CREDS, `${c}:${SANDBOX_HOME}/.claude/.credentials.json`], { timeout: 15000 });
-      await runDocker(
-        ['exec', '-u', 'root', c, 'chown', `${SANDBOX_USER}:${SANDBOX_USER}`, `${SANDBOX_HOME}/.claude/.credentials.json`],
-        { timeout: 10000 }
-      ).catch(() => {});
-      ok++;
-    } catch (err) {
-      console.error(`creds sync -> ${c} failed: ${(err.stderr || err.message || '').trim()}`);
-    }
-  }
-  if (ok) console.log(`[creds] synced credentials into ${ok} sandbox container(s)`);
-  return ok;
 }
 
 // Is /dev/kvm present on the host, and what group owns it? Returns
@@ -296,34 +260,25 @@ function kvmInfo() {
   }
 }
 
-// Deterministic, docker-safe names derived from the session identity (name+dir).
-// The container name is human-readable; a short hash keeps two same-named
-// sessions in different directories from colliding. The home volume persists
-// Claude's per-session history so `--resume <uuid>` works across restarts.
-function sandboxNames(name, dir) {
+// Deterministic, docker-safe container name from the session identity (name+dir).
+// A short hash keeps two same-named sessions in different directories from
+// colliding. Session history now lives in the shared host ~/.claude (mounted in),
+// so there's no per-session volume.
+function sandboxContainerName(name, dir) {
   const hash = crypto.createHash('sha1').update(`${name}\0${dir}`).digest('hex');
   const clean = name.toLowerCase().replace(/[^a-z0-9_.-]/g, '-').replace(/^[^a-z0-9]+/, '') || 'session';
-  return {
-    container: `claude-sandbox-${clean}-${hash.slice(0, 6)}`,
-    homeVolume: `claude-mgr-home-${hash.slice(0, 16)}`,
-  };
+  return `claude-sandbox-${clean}-${hash.slice(0, 6)}`;
 }
 
-// Does the sandbox home volume actually contain the saved conversation for this
-// session UUID? A remembered UUID whose session never got written (e.g. the
-// first run died on a prompt) would make `claude --resume` hard-fail and the
-// tmux window vanish. Claude stores sessions at ~/.claude/projects/<enc>/<uuid>.jsonl;
-// we glob across encodings. Runs a throwaway container mounting just the volume.
-async function sandboxSessionSaved(volume, uuid) {
+// Does the saved conversation for this UUID exist? A remembered UUID whose
+// session never got written (e.g. the first run died on a prompt) would make
+// `claude --resume` hard-fail and the tmux window vanish. Sandbox containers run
+// with cwd /workspace, so Claude files them under ~/.claude/projects/-workspace/
+// — and since ~/.claude is the shared host dir, we can check the host FS directly
+// (no container spawn).
+function sandboxSessionSaved(uuid) {
   try {
-    await runDocker(
-      [
-        'run', '--rm', '-v', `${volume}:${SANDBOX_HOME}/.claude`, DOCKER_IMAGE,
-        'bash', '-lc', `ls ${SANDBOX_HOME}/.claude/projects/*/${uuid}.jsonl >/dev/null 2>&1`,
-      ],
-      { timeout: 20000 }
-    );
-    return true; // exit 0 → the session file exists
+    return fs.existsSync(path.join(HOST_CLAUDE_DIR, 'projects', '-workspace', `${uuid}.jsonl`));
   } catch {
     return false;
   }
@@ -710,17 +665,16 @@ async function buildClaudeArgs(name, dir, resume, permissionMode, sandbox, kvm) 
   let sessionId = null;
   if (resume) {
     sessionId = await lookupSession(name, dir);
-    // In a sandbox a remembered UUID only resumes if it was actually written to
-    // the volume; otherwise `--resume` fails and the window dies. Verify first.
-    if (sessionId && sandbox) {
-      const { homeVolume } = sandboxNames(name, dir);
-      if (!(await sandboxSessionSaved(homeVolume, sessionId))) sessionId = null;
+    // In a sandbox a remembered UUID only resumes if the conversation was
+    // actually written; otherwise `--resume` fails and the window dies. Verify.
+    if (sessionId && sandbox && !sandboxSessionSaved(sessionId)) {
+      sessionId = null;
     }
     if (sessionId) {
       args.push('--resume', sessionId);
       await rememberSession(name, dir, sessionId, permissionMode, sandbox, kvm); // refresh lastUsed
     } else if (sandbox) {
-      // Nothing safely resumable in the volume — start a fresh session so the
+      // Nothing safely resumable — start a fresh session so the
       // window always launches (a sandbox `--continue` would also hard-fail).
       sessionId = crypto.randomUUID();
       args.push('--session-id', sessionId);
@@ -738,23 +692,20 @@ async function buildClaudeArgs(name, dir, resume, permissionMode, sandbox, kvm) 
 }
 
 // The tmux window command for a sandboxed session: run claude inside a fresh
-// container (via `sg docker -c`), mounting the project at /workspace, the host
-// credentials read-only, and a persistent per-session volume for Claude's home
-// so resume works across container restarts. Inside the container cwd is always
+// container (via `sg docker -c`), mounting the project at /workspace and the
+// host's ~/.claude live so the container shares the host's credentials (one
+// refresh chain) and session history. Inside the container cwd is always
 // /workspace, so `--session-id`/`--resume` args (from buildClaudeArgs) apply
 // there. Every field is shell-quoted by dockerCmd()/shq(), so the canonical
 // `dir` (which may contain spaces) and validated `name` can't inject.
 function sandboxWindowCmd(name, dir, claudeArgs, kvm) {
-  const { container, homeVolume } = sandboxNames(name, dir);
+  const container = sandboxContainerName(name, dir);
   const runArgs = [
     'run', '-it', '--rm',
     '--name', container,
     '--hostname', container,
     '-v', `${dir}:/workspace`,
   ];
-  if (CLAUDE_CREDS && fs.existsSync(CLAUDE_CREDS)) {
-    runArgs.push('-v', `${CLAUDE_CREDS}:/run/claude-creds/.credentials.json:ro`);
-  }
   // Map /dev/kvm in and grant its owning group so the container user can open
   // it (device is mode 0660, group-owned).
   if (kvm) {
@@ -765,7 +716,8 @@ function sandboxWindowCmd(name, dir, claudeArgs, kvm) {
     }
   }
   runArgs.push(
-    '-v', `${homeVolume}:${SANDBOX_HOME}/.claude`,
+    // Live host ~/.claude: shared credentials + history (see HOST_CLAUDE_DIR).
+    '-v', `${HOST_CLAUDE_DIR}:${SANDBOX_HOME}/.claude`,
     '-w', '/workspace',
     DOCKER_IMAGE,
     // claudeArgs[0] === 'claude' — the container entrypoint runs it directly.
@@ -1005,12 +957,15 @@ async function getConfig(req, res) {
 
 // POST /api/docker/build — build the sandbox image on demand (so the user can
 // pre-build with the UI rather than blocking the first session on it).
+// body: { force?: bool } — force rebuilds an existing image to pull the current
+// Claude Code (running sandbox sessions must be restarted to pick it up).
 async function buildDockerImage(req, res) {
   if (!(await dockerAvailable())) {
     return sendJson(res, 503, { error: 'Docker is not available.' });
   }
+  const body = await readBody(req).catch(() => ({}));
   try {
-    await ensureDockerImage();
+    await ensureDockerImage(body.force === true);
   } catch (err) {
     const msg = (err.stderr || err.message || '').trim();
     return sendJson(res, 500, { error: `Build failed: ${msg}` });
@@ -1216,10 +1171,5 @@ server.listen(PORT, BIND, () => {
     // First sample shortly after start, then on the interval.
     setTimeout(() => sampleMemoryOnce().catch(() => {}), 5000);
     setInterval(() => sampleMemoryOnce().catch(() => {}), MEM_LOG_INTERVAL_MS);
-  }
-  if (CREDS_SYNC_MIN > 0) {
-    console.log(`  creds sync  : sandbox containers every ${CREDS_SYNC_MIN} min`);
-    setTimeout(() => syncCredsToSandboxes().catch(() => {}), 20000);
-    setInterval(() => syncCredsToSandboxes().catch(() => {}), CREDS_SYNC_MIN * 60 * 1000);
   }
 });
