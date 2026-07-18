@@ -125,7 +125,10 @@ main { max-width: 920px; margin: 0 auto; padding: 22px; }
 .session.active .sw-status { box-shadow: 0 0 0 4px rgba(70,184,106,0.18); }
 
 .session .sw-main { flex: 1; min-width: 0; }
-.session .sw-name { font-weight: 600; display: flex; align-items: center; gap: 8px; }
+/* Wrap so a long name + its tags (claude/docker/memory) flow onto new lines
+   inside sw-main instead of overflowing rightward over the action buttons on
+   narrow (mobile) screens. */
+.session .sw-name { font-weight: 600; display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; overflow-wrap: anywhere; }
 .session .sw-name .idx { font-family: var(--mono); font-size: 12px; color: var(--text-dim); }
 .session .sw-title { color: var(--text-dim); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .session .sw-cwd { color: var(--text-dim); font-family: var(--mono); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -268,9 +271,11 @@ form { padding: 18px 20px; overflow-y: auto; min-height: 0; }
 .h-session .h-meta {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   flex: none;
 }
+/* Compact secondary "Delete" on recent entries. */
+.btn-forget { padding: 6px 10px; }
 .h-ago {
   font-size: 12px;
   color: var(--text-dim);

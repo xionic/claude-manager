@@ -99,7 +99,8 @@ or in your shell when running directly).
 | `CM_TMUX_BIN`       | `/usr/bin/tmux`               | tmux binary                                      |
 | `CM_CLAUDE_BIN`     | `claude`                      | claude binary (resolved on the service's PATH)   |
 | `CM_TMUX_SOCKET`    | `/tmp/tmux-<uid>/default`     | tmux socket path                                 |
-| `CM_MEM_LOG`        | `~/.claude-manager-memory.log`| Per-session memory history log (set interval to 0 to disable) |
+| `CM_MEM_ENABLED`    | `off`                         | Master switch for the memory module: cgroup-slice pooling, the per-session memory figure, and the memory log. Needs the `claude.slice`/`claude-docker.slice` units — off by default. Enable with `1`, or `touch .mem-enabled` in the app dir. |
+| `CM_MEM_LOG`        | `~/.claude-manager-memory.log`| Per-session memory history log (only when the memory module is on) |
 | `CM_MEM_LOG_INTERVAL_MS` | `60000`                  | How often to sample session memory               |
 | `CM_DOCKER_IMAGE`   | `claude-sandbox:latest`       | Image tag for sandboxed sessions                 |
 | `CM_HOST_CLAUDE_DIR`| `~/.claude`                   | Host Claude dir bind-mounted live into a sandbox |

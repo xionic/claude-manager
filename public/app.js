@@ -337,6 +337,11 @@ function renderRecent() {
               data-h-sandbox="${e.sandbox ? '1' : '0'}"
               data-h-kvm="${e.kvm ? '1' : '0'}"
             >Resume</button>
+            <button class="btn btn-danger btn-forget"
+              data-del-name="${escapeHtml(e.name)}"
+              data-del-dir="${escapeHtml(e.dir)}"
+              title="Forget this session (frees the name; the conversation on disk is kept)"
+            >Delete</button>
           </div>
         </div>`;
     })
@@ -564,17 +569,18 @@ function init() {
   // Toggling the sandbox checkbox shows/hides the dependent KVM option.
   $('#f-docker').addEventListener('change', setupKvmField);
 
-  // Session names can't contain spaces (they become the tmux window / remote-
-  // control id), so turn them into hyphens as the user types. Space→hyphen is
-  // 1:1, so the caret position is preserved.
-  $('#f-name').addEventListener('input', (e) => {
-    const el = e.target;
+  // Turn spaces into hyphens as the user types. Session names can't contain
+  // spaces (they become the tmux window / remote-control id); new folder names
+  // follow the same convention. Space→hyphen is 1:1, so the caret is preserved.
+  const hyphenateOnInput = (el) => el.addEventListener('input', () => {
     if (el.value.includes(' ')) {
       const pos = el.selectionStart;
       el.value = el.value.replace(/ /g, '-');
       el.setSelectionRange(pos, pos);
     }
   });
+  hyphenateOnInput($('#f-name'));
+  hyphenateOnInput($('#newdir-name'));
 
   // Close handlers
   document.querySelectorAll('[data-close]').forEach((el) => el.addEventListener('click', closeModal));
@@ -636,6 +642,24 @@ function init() {
 
   // Resume from history (event-delegated)
   $('#history').addEventListener('click', async (e) => {
+    // Delete (forget) a remembered session, with confirmation.
+    const del = e.target.closest('[data-del-name]');
+    if (del) {
+      const dName = del.dataset.delName;
+      const dDir = del.dataset.delDir;
+      if (!confirm(`Delete "${dName}" from recent sessions?\n\nThis frees the name for reuse. The conversation on disk is kept and can still be resumed if you recreate the session with the same name and directory.`)) return;
+      del.disabled = true;
+      try {
+        await api('api/history', { method: 'DELETE', body: JSON.stringify({ name: dName, dir: dDir }) });
+        banner(`Deleted "${dName}" from recent.`, 'success');
+        await loadHistory();
+      } catch (err) {
+        banner(`Failed to delete: ${err.message}`, 'error');
+        del.disabled = false;
+      }
+      return;
+    }
+
     const btn = e.target.closest('[data-h-name]');
     if (!btn) return;
     const name = btn.dataset.hName;
@@ -643,10 +667,16 @@ function init() {
     const permissionMode = btn.dataset.hPerm || 'auto';
     const sandbox = btn.dataset.hSandbox === '1';
     const kvm = btn.dataset.hKvm === '1';
-    // Offer autoclaude only when it exists and the session must be created fresh.
+    // The tmux session must be created to resume; optionally add autoclaude to
+    // it. This choice is ONLY about autoclaude — the resume happens either way,
+    // so the wording spells out what Cancel does (resume without autoclaude).
     let startAutoclaude = false;
     if (config.autoclaudeAvailable && !sessionExists) {
-      startAutoclaude = confirm('The tmux session isn’t running yet — also start autoclaude in it?');
+      startAutoclaude = confirm(
+        'The tmux session isn’t running — resuming will start it.\n\n' +
+        'Also start autoclaude in the new session?\n\n' +
+        'OK = start autoclaude too   ·   Cancel = resume without autoclaude'
+      );
     }
     btn.disabled = true;
     btn.textContent = 'Starting…';

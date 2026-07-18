@@ -35,6 +35,28 @@ const CLAUDE_BIN = process.env.CM_CLAUDE_BIN || 'claude';
 const DOCKER_BIN = process.env.CM_DOCKER_BIN || 'docker';
 const DOCKER_IMAGE = process.env.CM_DOCKER_IMAGE || 'claude-sandbox:latest';
 const DOCKER_DIR = process.env.CM_DOCKER_DIR || path.join(__dirname, 'docker');
+
+// --- Memory module (off by default) ---
+// Master switch for everything memory-related: launching sessions into cgroup
+// slices (memory pooling), the per-session memory figure in the UI, and the
+// memory log. Off by default because it depends on host setup that a generic
+// install won't have — the claude.slice / claude-docker.slice systemd units.
+// Enable with CM_MEM_ENABLED=1, or — without touching the systemd unit — by
+// creating a `.mem-enabled` marker file in the app dir (gitignored; `touch` to
+// turn on, delete to turn off).
+const MEM_ENABLED =
+  /^(1|true|yes|on)$/i.test(process.env.CM_MEM_ENABLED || '') ||
+  fs.existsSync(path.join(__dirname, '.mem-enabled'));
+
+// --- Memory pooling (cgroup slices) — only used when MEM_ENABLED ---
+// Host sessions are wrapped in a transient scope under the user-level
+// claude.slice (~/.config/systemd/user/claude.slice); sandbox containers are
+// parented under the system-level claude-docker.slice
+// (/etc/systemd/system/claude-docker.slice). Each slice's MemoryMax caps the
+// *combined* usage of everything inside it, so a runaway session gets
+// OOM-killed inside the pool instead of thrashing the whole box.
+const HOST_SLICE = process.env.CM_HOST_SLICE || 'claude.slice';
+const DOCKER_CGROUP_PARENT = process.env.CM_DOCKER_CGROUP_PARENT || 'claude-docker.slice';
 // The unprivileged user (and its home) inside the sandbox image — must match
 // docker/Dockerfile. Centralised so the volume mount, resume check and
 // credential sync can never drift apart again (as they did when the image user
@@ -131,25 +153,55 @@ function tmux(args) {
   });
 }
 
-// Resident memory (bytes) of a tmux pane's whole process subtree, read from its
-// cgroup. Debian's tmux puts each pane in its own transient systemd scope
-// (tmux-spawn-<uuid>.scope), so that scope's memory.current is the exact live
-// total for the session — the claude process plus every child it spawns (bash,
-// tool subprocesses, subagents). This is what runs the box out of RAM, so it's
-// the number worth watching. Returns bytes, or null when it can't be read:
-// the pane just exited (race), or — for a sandbox session — the real work runs
-// in the container's own cgroup, not the pane's, so this undercounts those (the
-// pane only holds the small `docker run` client). cgroup v2 only.
+// Real (non-reclaimable) memory in bytes of a tmux pane's whole process subtree,
+// read from its cgroup. We report `anon` (anonymous memory — heap/stack) from
+// memory.stat rather than memory.current: the latter also counts reclaimable
+// page cache, which the kernel frees the instant anything needs RAM but which
+// inflates the figure for an idle session that merely read large files (a CAD or
+// video workspace can show 1–2 GB of pure cache). `anon` is the working set that
+// actually stays put — the number worth watching for running the box out of RAM.
+//
+// Debian's tmux puts each pane in its own transient systemd scope
+// (tmux-spawn-<uuid>.scope) covering the claude process plus every child it
+// spawns (bash, tool subprocesses, subagents). Returns bytes, or null when it
+// can't be read: the pane just exited (race), or — for a sandbox session — the
+// real work runs in the container's own cgroup, not the pane's, so this
+// undercounts those (the pane only holds the small `docker run` client). Host
+// sessions are launched via `systemd-run --scope`, which stays in the pane's
+// tmux-spawn scope while its child (claude) is moved into HOST_SLICE — so when a
+// direct child of the pane process sits in a different cgroup, that child's
+// cgroup is the session's real subtree and is the one measured. cgroup v2 only.
 async function paneMemoryBytes(panePid) {
   const pid = parseInt(panePid, 10);
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  try {
-    // cgroup v2 gives a single "0::<path>" line for the process.
-    const cg = await fsp.readFile(`/proc/${pid}/cgroup`, 'utf8');
+  // cgroup v2 gives a single "0::<path>" line for the process.
+  const cgroupOf = async (p) => {
+    const cg = await fsp.readFile(`/proc/${p}/cgroup`, 'utf8');
     const m = cg.match(/^0::(.*)$/m);
-    if (!m) return null;
-    const memFile = path.join('/sys/fs/cgroup', m[1], 'memory.current');
-    const bytes = parseInt((await fsp.readFile(memFile, 'utf8')).trim(), 10);
+    return m ? m[1] : null;
+  };
+  try {
+    let cgPath = await cgroupOf(pid);
+    if (!cgPath) return null;
+    try {
+      const kids = (await fsp.readFile(`/proc/${pid}/task/${pid}/children`, 'utf8'))
+        .trim().split(/\s+/).filter(Boolean);
+      for (const kid of kids) {
+        const kidCg = await cgroupOf(kid).catch(() => null);
+        if (kidCg && kidCg !== cgPath) {
+          cgPath = kidCg;
+          break;
+        }
+      }
+    } catch {
+      /* children file unreadable (race) — fall back to the pane's own scope */
+    }
+    // `anon` = anonymous (non-file-backed) memory of everything in the cgroup;
+    // excludes the reclaimable page cache that memory.current would include.
+    const statFile = path.join('/sys/fs/cgroup', cgPath, 'memory.stat');
+    const stat = await fsp.readFile(statFile, 'utf8');
+    const m = stat.match(/^anon (\d+)$/m);
+    const bytes = m ? parseInt(m[1], 10) : NaN;
     return Number.isFinite(bytes) ? bytes : null;
   } catch {
     return null;
@@ -288,9 +340,10 @@ function sandboxSessionSaved(uuid) {
 // container's cgroup memory. One `docker ps` + one `docker inspect` over only
 // the running containers, so a stale/dead session name can never break the
 // batch (missing names simply won't appear). With the systemd cgroup driver the
-// init PID's cgroup is the container's own docker-<id>.scope, whose
-// memory.current is the full container total — the same metric paneMemoryBytes
-// reads for host panes. Empty map if docker is down or nothing is running.
+// init PID's cgroup is the container's own docker-<id>.scope, whose memory.stat
+// `anon` is the container's real (non-cache) memory — the same metric
+// paneMemoryBytes reads for host panes. Empty map if docker is down or nothing
+// is running.
 async function containerInitPids() {
   const map = new Map();
   try {
@@ -449,6 +502,15 @@ async function lookupSession(name, dir) {
 // Returns { created } — true when this call brought the session into being, so
 // the caller can offer to start autoclaude in a genuinely fresh session.
 async function ensureTmuxSession() {
+  // tmux won't create the socket's parent dir when given an explicit `-S` path,
+  // so after a reboot (which wipes /tmp) the very first `new-session` fails with
+  // "error connecting … (No such file or directory)". Pre-create it (0700, as
+  // tmux requires) so a fresh server can bind its socket.
+  try {
+    await fsp.mkdir(path.dirname(TMUX_SOCKET), { recursive: true, mode: 0o700 });
+  } catch (err) {
+    if (err.code !== 'EEXIST') console.error(`could not create tmux socket dir: ${err.message}`);
+  }
   try {
     await tmux(['has-session', '-t', TMUX_SESSION]);
     return { created: false };
@@ -619,22 +681,26 @@ async function gatherSessions() {
       };
     });
 
-  // Per-session memory (cgroup memory.current). Host sessions: read the pane's
-  // own scope. Sandbox sessions: the pane only holds the `docker run` client —
-  // the real work lives in the container's cgroup — so resolve each container's
-  // host init PID (one docker call for all of them) and read that scope instead.
-  const sandboxed = windows.filter((w) => w.sandbox && w.container);
-  const containerPids = sandboxed.length ? await containerInitPids() : new Map();
-  await Promise.all(
-    windows.map(async (w) => {
-      if (w.sandbox && w.container) {
-        const cpid = containerPids.get(w.container);
-        w.memoryBytes = cpid ? await paneMemoryBytes(cpid) : null;
-      } else {
-        w.memoryBytes = await paneMemoryBytes(w.pid);
-      }
-    })
-  );
+  // Per-session real memory (cgroup anon, excluding reclaimable page cache) —
+  // only when the memory module is enabled. Host sessions: read the pane's own
+  // scope. Sandbox sessions: the pane only holds the `docker run` client — the
+  // real work lives in the container's cgroup — so resolve each container's host
+  // init PID (one docker call for all of them) and read that scope instead. When
+  // disabled, memoryBytes is left null and the UI shows no memory figure.
+  if (MEM_ENABLED) {
+    const sandboxed = windows.filter((w) => w.sandbox && w.container);
+    const containerPids = sandboxed.length ? await containerInitPids() : new Map();
+    await Promise.all(
+      windows.map(async (w) => {
+        if (w.sandbox && w.container) {
+          const cpid = containerPids.get(w.container);
+          w.memoryBytes = cpid ? await paneMemoryBytes(cpid) : null;
+        } else {
+          w.memoryBytes = await paneMemoryBytes(w.pid);
+        }
+      })
+    );
+  }
 
   return { session: TMUX_SESSION, available: true, windows };
 }
@@ -704,6 +770,9 @@ function sandboxWindowCmd(name, dir, claudeArgs, kvm) {
     'run', '-it', '--rm',
     '--name', container,
     '--hostname', container,
+    // Pool the container's memory under the docker slice only when the memory
+    // module is on (the slice must exist); otherwise use docker's default cgroup.
+    ...(MEM_ENABLED ? ['--cgroup-parent', DOCKER_CGROUP_PARENT] : []),
     '-v', `${dir}:/workspace`,
   ];
   // Map /dev/kvm in and grant its owning group so the container user can open
@@ -812,7 +881,26 @@ async function createSession(req, res) {
     // persistent home volume keeps the session history regardless.
     ({ cmd: windowCmd, container } = sandboxWindowCmd(name, dir, claudeArgs, kvm));
     await runDocker(['rm', '-f', container], { timeout: 20000 }).catch(() => {});
+  } else if (MEM_ENABLED) {
+    // Wrap in a transient scope under HOST_SLICE so all host sessions share
+    // that slice's aggregate memory cap. XDG_RUNTIME_DIR is set explicitly
+    // because the pane environment (inherited from the tmux server, which may
+    // have been started by this service) can lack the user-bus variables
+    // systemd-run --user needs. All added tokens are shell-safe literals.
+    windowCmd = [
+      'env', `XDG_RUNTIME_DIR=/run/user/${process.getuid()}`,
+      'systemd-run', '--user', '--scope', `--slice=${HOST_SLICE}`,
+      '--collect', '--quiet', '--',
+      // The tmux server runs as infrastructure with OOMScoreAdjust=-1000 (never an
+      // OOM victim; see tmux-claude.service), and panes inherit that. A session must
+      // stay individually killable so claude.slice's cap can OOM-contain a runaway
+      // one — so re-enable OOM for this session (raising oom_score_adj is always
+      // permitted) before exec'ing the real claude in its place.
+      'bash', '-c', 'echo 200 > /proc/self/oom_score_adj 2>/dev/null; exec "$@"',
+      'claude-oom-reset', CLAUDE_BIN, ...claudeArgs.slice(1),
+    ];
   } else {
+    // Memory module off: launch claude directly in the pane.
     windowCmd = [CLAUDE_BIN, ...claudeArgs.slice(1)];
   }
 
@@ -932,6 +1020,24 @@ async function killSession(req, res, windowId) {
 async function listHistory(req, res) {
   const state = await loadState();
   sendJson(res, 200, { entries: state.history });
+}
+
+// DELETE /api/history — forget a remembered session (removes it from the Recent
+// list and the name→UUID map, freeing the name for reuse). body: { name, dir }.
+// The underlying Claude conversation on disk is left untouched.
+async function deleteHistoryEntry(req, res) {
+  const body = await readBody(req);
+  const name = String(body.name || '').trim();
+  const dir = String(body.dir || '').trim();
+  if (!name || !dir) {
+    return sendJson(res, 400, { error: 'Both name and dir are required.' });
+  }
+  const state = await loadState();
+  const before = state.history.length;
+  state.history = state.history.filter((e) => !(e.name === name && e.dir === dir));
+  delete state.sessions[sessionKey(name, dir)];
+  await writeJsonAtomic(STATE_FILE, state);
+  sendJson(res, 200, { ok: true, removed: before - state.history.length });
 }
 
 // GET /api/config — capabilities the UI uses to show/hide options. Docker and
@@ -1146,6 +1252,7 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/api/mkdir' && req.method === 'POST') return await makeDir(req, res);
 
     if (pathname === '/api/history' && req.method === 'GET') return await listHistory(req, res);
+    if (pathname === '/api/history' && req.method === 'DELETE') return await deleteHistoryEntry(req, res);
 
     if (pathname === '/api/config' && req.method === 'GET') return await getConfig(req, res);
     if (pathname === '/api/docker/build' && req.method === 'POST') return await buildDockerImage(req, res);
@@ -1166,7 +1273,8 @@ server.listen(PORT, BIND, () => {
   console.log(`  tmux socket : ${TMUX_SOCKET}`);
   console.log(`  tmux session: ${TMUX_SESSION}`);
   console.log(`  allowed roots: ${ALLOWED_ROOTS.join(', ')}`);
-  if (MEM_LOG_INTERVAL_MS > 0) {
+  console.log(`  memory module: ${MEM_ENABLED ? 'on' : 'off'}`);
+  if (MEM_ENABLED && MEM_LOG_INTERVAL_MS > 0) {
     console.log(`  memory log  : ${MEM_LOG} (every ${Math.round(MEM_LOG_INTERVAL_MS / 1000)}s)`);
     // First sample shortly after start, then on the interval.
     setTimeout(() => sampleMemoryOnce().catch(() => {}), 5000);
